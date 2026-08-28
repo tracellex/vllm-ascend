@@ -40,16 +40,16 @@ on:
         required: true
         default: false
         type: boolean
-      image_tag:
-        description: 'Intermediate image tag prefix; device and OS are appended automatically'
-        required: true
-        default: test
-        type: string
       release_tag:
-        description: 'Final image tag prefix; device and OS are appended automatically'
+        description: 'Image tag prefix; device and OS are appended automatically'
         required: true
         default: release
         type: string
+      manifest:
+        description: 'Publish the multi-architecture manifest to the ascend repository'
+        required: true
+        default: false
+        type: boolean 
 
 permissions:
   contents: read
@@ -121,11 +121,11 @@ jobs:
     with:
       device: ${{ matrix.device }}
       os: ${{ matrix.os }}
-      image_tag: ${{ inputs.image_tag }}
       release_tag: ${{ inputs.release_tag }}
       source_ref: ${{ inputs.source_branch }}
       quay_username: ${{ vars.QUAY_USER_NAME }}
       atlas_quay_username: ${{ vars.QUAY_ATLAS_USER_NAME }}
+      manifest: ${{ inputs.manifest }}
     secrets:
       QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
       QUAY_ATLAS_TOKEN: ${{ secrets.QUAY_ATLAS_TOKEN }}

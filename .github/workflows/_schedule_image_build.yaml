@@ -11,12 +11,8 @@ on:
         description: 'Base operating system'
         required: true
         type: string
-      image_tag:
-        description: 'Image tag prefix for the intermediate image'
-        required: true
-        type: string
       release_tag:
-        description: 'Image tag prefix for the final published image'
+        description: 'Image tag prefix; device and OS are appended automatically'
         required: true
         type: string
       source_ref:
@@ -31,6 +27,10 @@ on:
         description: 'Quay username for pushing the intermediate image'
         required: true
         type: string
+      manifest:
+        description: 'Publish the multi-architecture manifest to the ascend repository'
+        required: true
+        type: boolean
     secrets:
       QUAY_TOKEN:
         description: 'Quay token for pushing the image'
@@ -73,7 +73,6 @@ jobs:
         env:
           DEVICE: ${{ inputs.device }}
           BASE_OS: ${{ inputs.os }}
-          IMAGE_TAG: ${{ inputs.image_tag }}
           RELEASE_TAG: ${{ inputs.release_tag }}
         run: |
           set -euo pipefail
@@ -90,10 +89,6 @@ jobs:
             *) echo "Unsupported operating system: $BASE_OS" >&2; exit 1 ;;
           esac
 
-          if [[ ! "$IMAGE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$ ]]; then
-            echo "Invalid image tag prefix: $IMAGE_TAG" >&2
-            exit 1
-          fi
           if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,63}$ ]]; then
             echo "Invalid release tag prefix: $RELEASE_TAG" >&2
             exit 1
@@ -112,12 +107,26 @@ jobs:
           tool-cache: true
           docker-images: false
 
-      - name: Login to Quay repository
+      - name: Login to Quay (atlas-ci)
         uses: docker/login-action@v4
         with:
           registry: quay.io
-          username: ${{ inputs.quay_username }}
-          password: ${{ secrets.QUAY_TOKEN }}
+          username: ${{ inputs.atlas_quay_username }}
+          password: ${{ secrets.QUAY_ATLAS_TOKEN }}
+
+      - name: Resolve push target
+        id: push-target
+        shell: bash
+        env:
+          DEVICE: ${{ inputs.device }}
+          BASE_OS: ${{ inputs.os }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ARCH_TAG: ${{ matrix.arch_tag }}
+        run: |
+          set -euo pipefail
+
+          temp_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH_TAG}-temp"
+          echo "build_output=type=image,name=${TEMP_IMAGE_REPO}:${temp_tag},push=true" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -126,7 +135,7 @@ jobs:
           driver: docker-container
           use: true
 
-      - name: Build and push architecture digest
+      - name: Build and push architecture image
         id: build
         uses: docker/build-push-action@v7
         with:
@@ -134,37 +143,14 @@ jobs:
           file: ${{ steps.dockerfile.outputs.path }}
           platforms: ${{ matrix.platform }}
           push: true
-          outputs: type=image,name=${{ env.IMAGE_REPO }},push-by-digest=true,name-canonical=true,push=true
+          outputs: ${{ steps.push-target.outputs.build_output }}
           build-args: |
             PIP_INDEX_URL=https://pypi.org/simple
             COMPILE_CUSTOM_KERNELS=1
           provenance: false
 
-      - name: Add temporary tag to protect digest from garbage collection
-        shell: bash
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          DEVICE: ${{ inputs.device }}
-          BASE_OS: ${{ inputs.os }}
-          IMAGE_TAG: ${{ inputs.image_tag }}
-          ARCH_TAG: ${{ matrix.arch_tag }}
-        run: |
-          set -euo pipefail
-
-          temp_tag="${IMAGE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH_TAG}-temp"
-
-          docker login quay.io \
-            -u "${{ inputs.quay_username }}" \
-            -p "${{ secrets.QUAY_TOKEN }}"
-          docker pull "${IMAGE_REPO}@${DIGEST}"
-
-          docker login quay.io \
-            -u "${{ inputs.atlas_quay_username }}" \
-            -p "${{ secrets.QUAY_ATLAS_TOKEN }}"
-          docker tag "${IMAGE_REPO}@${DIGEST}" "${TEMP_IMAGE_REPO}:${temp_tag}"
-          docker push "${TEMP_IMAGE_REPO}:${temp_tag}"
-
       - name: Export digest
+        if: ${{ fromJSON(inputs.manifest) }}
         shell: bash
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -174,6 +160,7 @@ jobs:
           touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
 
       - name: Upload digest
+        if: ${{ fromJSON(inputs.manifest) }}
         uses: actions/upload-artifact@v7
         with:
           name: digests-${{ inputs.device }}-${{ inputs.os }}-${{ matrix.arch_tag }}
@@ -185,6 +172,7 @@ jobs:
     name: Push multi-architecture image
     runs-on: ubuntu-latest
     needs: build-push-digest
+    if: ${{ fromJSON(inputs.manifest) }}
 
     steps:
       - name: Download architecture digests
@@ -222,7 +210,7 @@ jobs:
 
           digest_refs=()
           for digest in "${digests[@]}"; do
-            digest_refs+=("${IMAGE_REPO}@sha256:${digest}")
+            digest_refs+=("${TEMP_IMAGE_REPO}@sha256:${digest}")
           done
 
           final_image="${IMAGE_REPO}:${RELEASE_TAG}-${DEVICE}-${BASE_OS}"
