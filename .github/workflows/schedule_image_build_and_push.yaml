@@ -9,6 +9,7 @@ on:
         type: choice
         options:
           - main
+          - test_branch
         default: main
       build_a2:
         description: 'Build the A2 Dockerfile'
