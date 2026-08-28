@@ -6,10 +6,7 @@ on:
       source_branch:
         description: 'Branch of vllm-ascend-day0 to build'
         required: true
-        type: choice
-        options:
-          - main
-          - test_branch
+        type: string
         default: main
       build_a2:
         description: 'Build the A2 Dockerfile'
