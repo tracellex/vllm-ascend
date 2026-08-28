@@ -52,10 +52,10 @@ jobs:
       matrix:
         include:
           - platform: linux/amd64
-            runner: ubuntu-latest
+            runner: linux-amd64-cpu-4-cn12-001
             arch_tag: amd64
           - platform: linux/arm64
-            runner: ubuntu-22.04-arm
+            runner: linux-aarch64-cpu-4-cn12-001
             arch_tag: arm64
 
     steps:
@@ -170,7 +170,7 @@ jobs:
 
   merge-image:
     name: Push multi-architecture image
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu-4-cn12-001
     needs: build-push-digest
     if: ${{ fromJSON(inputs.manifest) }}
 

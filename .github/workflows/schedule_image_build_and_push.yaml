@@ -61,7 +61,7 @@ concurrency:
 jobs:
   prepare_matrix:
     name: Prepare selected build matrix
-    runs-on: ubuntu-latest
+    runs-on: linux-amd64-cpu-4-cn12-001
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
