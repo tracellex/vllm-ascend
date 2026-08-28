@@ -59,7 +59,7 @@ jobs:
             arch_tag: arm64
 
     steps:
-      - name: Checkout vllm-ascend-kimi-k3
+      - name: Checkout vllm-ascend-day0
         uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -128,12 +128,12 @@ jobs:
           temp_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${ARCH_TAG}-temp"
           echo "build_output=type=image,name=${TEMP_IMAGE_REPO}:${temp_tag},push=true" >> "$GITHUB_OUTPUT"
 
-      # - name: Set up Docker Buildx
-      #   uses: docker/setup-buildx-action@v4
-      #   with:
-      #     install: true
-      #     driver: docker-container
-      #     use: true
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          install: true
+          driver: docker-container
+          use: true
 
       - name: Build and push architecture image
         id: build
