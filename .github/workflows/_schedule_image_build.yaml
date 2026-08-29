@@ -154,25 +154,6 @@ jobs:
             COMPILE_CUSTOM_KERNELS=1
           provenance: false
 
-      - name: Export digest
-        if: ${{ fromJSON(inputs.manifest) }}
-        shell: bash
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-        run: |
-          set -euo pipefail
-          mkdir -p "${RUNNER_TEMP}/digests"
-          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
-
-      - name: Upload digest
-        if: ${{ fromJSON(inputs.manifest) }}
-        uses: actions/upload-artifact@v7
-        with:
-          name: digests-${{ inputs.device }}-${{ inputs.os }}-${{ matrix.arch_tag }}
-          path: ${{ runner.temp }}/digests/*
-          if-no-files-found: error
-          retention-days: 1
-
   merge-image:
     name: Push multi-architecture image
     runs-on: linux-amd64-cpu-4
@@ -182,13 +163,6 @@ jobs:
     if: ${{ fromJSON(inputs.manifest) }}
 
     steps:
-      - name: Download architecture digests
-        uses: actions/download-artifact@v8
-        with:
-          path: ${{ runner.temp }}/digests
-          pattern: digests-${{ inputs.device }}-${{ inputs.os }}-*
-          merge-multiple: true
-
       - name: Login to private Quay repository
         uses: docker/login-action@v4
         with:
@@ -212,16 +186,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          mapfile -t digests < <(find "${RUNNER_TEMP}/digests" -maxdepth 1 -type f -printf '%f\n')
-          if (( ${#digests[@]} != 2 )); then
-            echo "Expected 2 architecture digests, found ${#digests[@]}" >&2
-            exit 1
-          fi
-
-          digest_refs=()
-          for digest in "${digests[@]}"; do
-            digest_refs+=("${TEMP_IMAGE_REPO}@sha256:${digest}")
-          done
+          amd64_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64-temp"
+          arm64_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64-temp"
 
           # TEMP: test manifest phase without touching ascend
           # final_image="${IMAGE_REPO}:${RELEASE_TAG}-${DEVICE}"
@@ -233,7 +199,8 @@ jobs:
 
           docker buildx imagetools create \
             -t "$final_image" \
-            "${digest_refs[@]}"
+            "${TEMP_IMAGE_REPO}:${amd64_tag}" \
+            "${TEMP_IMAGE_REPO}:${arm64_tag}"
           echo "Published $final_image"
           {
             echo "### Published image"
