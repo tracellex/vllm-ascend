@@ -65,6 +65,13 @@ jobs:
             arch_tag: arm64
 
     steps:
+      - name: Pre-config git access token
+        run: |
+          # as we use a proxy but actions/checkout only set basic auth header for github.com
+          # so we set the extraheader manually
+          rm -fr /etc/gitconfig ~/.gitconfig
+          git config --global url."https://x-access-token:${{ secrets.GITHUB_TOKEN}}@gh-proxy.test.osinfra.cn/https://github.com/".insteadOf "https://github.com/"
+
       - name: Checkout vllm-ascend-day0
         uses: actions/checkout@v7
         with:

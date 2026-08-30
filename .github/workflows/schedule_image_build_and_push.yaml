@@ -6,8 +6,11 @@ on:
       source_branch:
         description: 'Branch of vllm-ascend-day0 to build'
         required: true
-        type: string
-        default: main
+        type: choice
+        options:
+          - main
+          - glm-5.3-flash-adapter
+        default: glm-5.3-flash-adapter
       build_a2:
         description: 'Build the A2 Dockerfile'
         required: true
