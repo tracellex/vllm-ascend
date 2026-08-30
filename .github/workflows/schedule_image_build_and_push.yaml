@@ -14,17 +14,17 @@ on:
       build_a2:
         description: 'Build the A2 Dockerfile'
         required: true
-        default: true
+        default: false
         type: boolean
       build_a3:
         description: 'Build the A3 Dockerfile'
         required: true
-        default: false
+        default: true
         type: boolean
       build_a5:
         description: 'Build the A5 Dockerfile'
         required: true
-        default: false
+        default: true
         type: boolean
       build_310p:
         description: 'Build the 310P Dockerfile'
@@ -39,17 +39,17 @@ on:
       build_openeuler:
         description: 'Build the openEuler variant'
         required: true
-        default: false
+        default: true
         type: boolean
       release_tag:
         description: 'Image tag prefix; device and OS are appended automatically'
         required: true
-        default: release
+        default: glm-5.3-flash
         type: string
       manifest:
         description: 'Publish the multi-architecture manifest to the ascend repository'
         required: true
-        default: false
+        default: true
         type: boolean 
 
 permissions:
