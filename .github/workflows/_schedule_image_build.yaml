@@ -51,8 +51,7 @@ jobs:
     name: Build ${{ matrix.arch_tag }}
     runs-on: ${{ matrix.runner }}
     container:
-      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
-    #   image: swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:9.1.0-a3-ubuntu22.04-py3.12
+      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-${{ inputs.device == 'a5' && '950' || inputs.device }}-${{ inputs.os == 'ubuntu' && 'ubuntu22.04' || 'openeuler24.03' }}-py3.12
     strategy:
       fail-fast: false
       matrix:
