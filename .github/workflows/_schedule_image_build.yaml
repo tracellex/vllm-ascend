@@ -157,8 +157,12 @@ jobs:
           push: true
           outputs: ${{ steps.push-target.outputs.build_output }}
           build-args: |
+            APTMIRROR=http://cache-service.nginx-pypi-cache.svc.cluster.local:8081
             PIP_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
-            COMPILE_CUSTOM_KERNELS=1
+            PIP_TRUSTED_HOST=cache-service.nginx-pypi-cache.svc.cluster.local
+            PYTORCH_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/whl/cpu
+            ASCEND_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/ascend/repos/pypi
+            GIT_PROXY=https://gh-proxy.test.osinfra.cn/
           provenance: false
 
   merge-image:
