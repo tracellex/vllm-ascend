@@ -9,8 +9,8 @@ on:
         type: choice
         options:
           - main
-          - glm-5.3-flash-adapter
-        default: glm-5.3-flash-adapter
+          - glm-5.3-flash-0830
+        default: glm-5.3-flash-0830
       build_a2:
         description: 'Build the A2 Dockerfile'
         required: true
