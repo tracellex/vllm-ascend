@@ -174,11 +174,8 @@ jobs:
         uses: docker/login-action@v4
         with:
           registry: quay.io
-          # TEMP: test manifest phase without touching ascend
-          # username: ${{ inputs.quay_username }}
-          # password: ${{ secrets.QUAY_TOKEN }}
-          username: ${{ inputs.atlas_quay_username }}
-          password: ${{ secrets.QUAY_ATLAS_TOKEN }}
+          username: ${{ inputs.quay_username }}
+          password: ${{ secrets.QUAY_TOKEN }}
 
       # - name: Set up Docker Buildx
       #   uses: docker/setup-buildx-action@v4
@@ -196,9 +193,7 @@ jobs:
           amd64_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64-temp"
           arm64_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64-temp"
 
-          # TEMP: test manifest phase without touching ascend
-          # final_image="${IMAGE_REPO}:${RELEASE_TAG}-${DEVICE}"
-          final_image="${TEMP_IMAGE_REPO}:${RELEASE_TAG}-${DEVICE}"
+          final_image="${IMAGE_REPO}:${RELEASE_TAG}-${DEVICE}"
 
           if [[ "$BASE_OS" == "openeuler" ]]; then
             final_image="${final_image}-openeuler"
@@ -206,8 +201,8 @@ jobs:
 
           docker buildx imagetools create \
             -t "$final_image" \
-            "${TEMP_IMAGE_REPO}:${amd64_tag}" \
-            "${TEMP_IMAGE_REPO}:${arm64_tag}"
+            "${IMAGE_REPO}:${amd64_tag}" \
+            "${IMAGE_REPO}:${arm64_tag}"
           echo "Published $final_image"
           {
             echo "### Published image"
