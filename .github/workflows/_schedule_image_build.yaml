@@ -157,7 +157,7 @@ jobs:
           push: true
           outputs: ${{ steps.push-target.outputs.build_output }}
           build-args: |
-            PIP_INDEX_URL=https://pypi.org/simple
+            PIP_INDEX_URL=http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple
             COMPILE_CUSTOM_KERNELS=1
           provenance: false
 
