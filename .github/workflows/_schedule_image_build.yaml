@@ -204,8 +204,8 @@ jobs:
 
           docker buildx imagetools create \
             -t "$final_image" \
-            "${IMAGE_REPO}:${amd64_tag}" \
-            "${IMAGE_REPO}:${arm64_tag}"
+            "${TEMP_IMAGE_REPO}:${amd64_tag}" \
+            "${TEMP_IMAGE_REPO}:${arm64_tag}"
           echo "Published $final_image"
           {
             echo "### Published image"
