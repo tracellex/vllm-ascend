@@ -87,7 +87,7 @@ jobs:
           set -euo pipefail
 
           case "$DEVICE" in
-            a2) dockerfile="Dockerfile" ;;
+            a2) dockerfile="Dockerfile.a2" ;;
             a3|a5|310p) dockerfile="Dockerfile.${DEVICE}" ;;
             *) echo "Unsupported device: $DEVICE" >&2; exit 1 ;;
           esac

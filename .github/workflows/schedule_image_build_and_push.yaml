@@ -14,7 +14,7 @@ on:
       build_a2:
         description: 'Build the A2 Dockerfile'
         required: true
-        default: false
+        default: true
         type: boolean
       build_a3:
         description: 'Build the A3 Dockerfile'
