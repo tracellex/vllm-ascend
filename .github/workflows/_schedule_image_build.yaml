@@ -27,10 +27,7 @@ on:
         description: 'Quay username for pushing the intermediate image'
         required: true
         type: string
-      manifest:
-        description: 'Publish the multi-architecture manifest to the ascend repository'
-        required: true
-        type: boolean
+
     secrets:
       QUAY_TOKEN:
         description: 'Quay token for pushing the image'
@@ -164,52 +161,3 @@ jobs:
             GIT_PROXY=https://gh-proxy.test.osinfra.cn/
           provenance: false
 
-  merge-image:
-    name: Push multi-architecture image
-    runs-on: linux-amd64-cpu-4
-    container:
-      image: swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/cann:9.1.0-a3-ubuntu22.04-py3.12
-    needs: build-push-digest
-    if: ${{ fromJSON(inputs.manifest) }}
-
-    steps:
-      - name: Login to private Quay repository
-        uses: docker/login-action@v4
-        with:
-          registry: quay.io
-          username: ${{ inputs.quay_username }}
-          password: ${{ secrets.QUAY_TOKEN }}
-
-      # - name: Set up Docker Buildx
-      #   uses: docker/setup-buildx-action@v4
-
-      - name: Merge and push multi-architecture manifest
-        shell: bash
-        env:
-          DEVICE: ${{ inputs.device }}
-          BASE_OS: ${{ inputs.os }}
-          RELEASE_TAG: ${{ inputs.release_tag }}
-          SOURCE_REF: ${{ inputs.source_ref }}
-        run: |
-          set -euo pipefail
-
-          amd64_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-amd64-temp"
-          arm64_tag="${RELEASE_TAG}-${DEVICE}-${BASE_OS}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-arm64-temp"
-
-          final_image="${IMAGE_REPO}:${RELEASE_TAG}-${DEVICE}"
-
-          if [[ "$BASE_OS" == "openeuler" ]]; then
-            final_image="${final_image}-openeuler"
-          fi
-
-          docker buildx imagetools create \
-            -t "$final_image" \
-            "${TEMP_IMAGE_REPO}:${amd64_tag}" \
-            "${TEMP_IMAGE_REPO}:${arm64_tag}"
-          echo "Published $final_image"
-          {
-            echo "### Published image"
-            echo "\`$final_image\`"
-            echo ""
-            echo "Source branch: \`$SOURCE_REF\`"
-          } >> "$GITHUB_STEP_SUMMARY"
