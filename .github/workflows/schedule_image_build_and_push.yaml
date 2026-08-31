@@ -45,6 +45,11 @@ on:
         description: 'Image tag prefix; device and OS are appended automatically'
         required: true
         type: string
+      manifest:
+        description: 'Publish the multi-architecture manifest to the ascend repository'
+        required: true
+        default: false
+        type: boolean 
 
 permissions:
   contents: read
@@ -120,6 +125,7 @@ jobs:
       source_ref: ${{ inputs.source_branch }}
       quay_username: ${{ vars.QUAY_USER_NAME }}
       atlas_quay_username: ${{ vars.QUAY_ATLAS_USER_NAME }}
+      manifest: ${{ inputs.manifest }}
     secrets:
       QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
       QUAY_ATLAS_TOKEN: ${{ secrets.QUAY_ATLAS_TOKEN }}
