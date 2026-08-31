@@ -44,12 +44,11 @@ on:
       release_tag:
         description: 'Image tag prefix; device and OS are appended automatically'
         required: true
-        default: glm-5.3-flash
         type: string
       manifest:
         description: 'Publish the multi-architecture manifest to the ascend repository'
         required: true
-        default: true
+        default: false
         type: boolean 
 
 permissions:
