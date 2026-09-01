@@ -75,7 +75,7 @@ jobs:
           set -euo pipefail
 
           devices=()
-          [[ "$BUILD_A2" == "true" ]] && devices+=("a2")
+          [[ "$BUILD_A2" == "true" ]] && devices+=("910b")
           [[ "$BUILD_A3" == "true" ]] && devices+=("a3")
           [[ "$BUILD_A5" == "true" ]] && devices+=("a5")
           [[ "$BUILD_310P" == "true" ]] && devices+=("310p")
