@@ -12,7 +12,8 @@ on:
           - glm-5.3-flash-0830
           - glm-5.3-flash-0831
           - glm-5.3-flash-0902
-        default: glm-5.3-flash-0902
+          - glm-5.3-flash-0902-1
+        default: glm-5.3-flash-0902-1
       build_a2:
         description: 'Build the A2 Dockerfile'
         required: true
