@@ -6,7 +6,7 @@ The heavy part is scoring every compressed pool against the token's
 head-weighted query: a paged-cache gather plus a 128-dim matvec. Doing that in
 torch lowers to an aclnnIndex/SearchSorted small-op flood, so it stays in one
 triton kernel that writes the raw pool scores to a scratch buffer. The top-k
-selection itself is a single fused aclnn ``topk`` call, followed by a few
+selection uses bounded-width aclnn ``topk`` calls, followed by a few
 element-wise ops for pool->token expansion and causal tail append.
 
 There is no hard length limit: the kernel tiles pools dynamically, and the
@@ -124,6 +124,39 @@ def _glm5_next_lightning_indexer_score_kernel(
         tl.store(scores_ptr + local_token_idx * max_pool_seq_len + pool_offsets, scores, mask=in_range)
 
 
+def _topk_pool_scores(scores: torch.Tensor, k: int):
+    """Select pool scores without wide TopKV2 reductions.
+
+    CANN 9.1 TopKV2 can fault on float32 [128, 8193], k=512,
+    with all -inf rows. Keep every reduction at width <=4096 for
+    the supported narrow KPool path (k<=512), including merge levels.
+    No score sanitization or host synchronization is performed.
+    Equal-score indices retain torch.topk's unspecified tie semantics.
+    """
+    chunk_width = 4096
+    if k > 512 or scores.shape[1] <= chunk_width:
+        return torch.topk(scores, k, dim=1)
+
+    values = scores
+    indices = None
+    while values.shape[1] > chunk_width:
+        next_values = []
+        next_indices = []
+        for start in range(0, values.shape[1], chunk_width):
+            part = values[:, start : start + chunk_width].contiguous()
+            part_values, part_indices = torch.topk(part, min(k, part.shape[1]), dim=1)
+            if indices is None:
+                part_indices = part_indices + start
+            else:
+                part_indices = torch.gather(indices[:, start : start + chunk_width], 1, part_indices)
+            next_values.append(part_values)
+            next_indices.append(part_indices)
+        values = torch.cat(next_values, dim=1)
+        indices = torch.cat(next_indices, dim=1)
+    result_values, selected = torch.topk(values, k, dim=1)
+    return result_values, torch.gather(indices, 1, selected)
+
+
 def _next_power_of_2(value: int) -> int:
     return 1 << (value - 1).bit_length()
 
@@ -206,7 +239,7 @@ def glm5_next_lightning_indexer_triton(
             TRITON_POOL_SUBTILE_SIZE,
         )
 
-        topk_vals, pool_ids = torch.topk(scores, topk, dim=1)
+        topk_vals, pool_ids = _topk_pool_scores(scores, topk)
         pool_ids = torch.where(
             topk_vals == float("-inf"),
             torch.full_like(pool_ids, -1),

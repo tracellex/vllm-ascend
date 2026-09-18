@@ -82,6 +82,8 @@ from vllm.v1.attention.backends.mla.indexer import (
     get_max_prefill_buffer_size,
 )
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+# [xr-conv-native] decode 因果卷积原生化（main #16251 第 1 步）
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
@@ -166,6 +168,83 @@ class AscendGlm5NextGatedRMSNormParams(nn.Module):
             torch.zeros(hidden_size),
             persistent=False,
         )
+
+
+from vllm.logger import init_logger as _glm_init_logger
+
+_glm_logger = _glm_init_logger(__name__)
+_glm_warned_keys: set[str] = set()
+
+
+def _glm_warn_once(key: str, message: str) -> None:
+    """进程内同名告警只输出一次（不依赖 vllm logger 的 *_once 接口差异）。"""
+    if key in _glm_warned_keys:
+        return
+    _glm_warned_keys.add(key)
+    _glm_logger.warning(message)
+
+
+def _glm_stage_padded_conv_state(
+    conv_state: torch.Tensor,
+    cache_indices: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor] | None]:
+    """把 block stride 被填充过的 conv state 展成连续视图（同 kimi KDA 做法）。
+
+    算子按连续块访问 cache line、忽略 block stride；cache 天然连续时直接返回原张量，
+    零开销。
+    """
+    natural_block_stride = conv_state[0].numel()
+    if conv_state.stride(0) == natural_block_stride:
+        return conv_state, cache_indices, None
+
+    flat_indices = cache_indices.flatten()
+    valid_mask = flat_indices != PAD_SLOT_ID
+    safe_indices = flat_indices.masked_fill(~valid_mask, 0).to(torch.long)
+    staged_state = conv_state.index_select(0, safe_indices).contiguous()
+
+    local_indices = torch.arange(
+        flat_indices.numel(),
+        dtype=cache_indices.dtype,
+        device=cache_indices.device,
+    )
+    local_indices = local_indices.masked_fill(~valid_mask, PAD_SLOT_ID)
+    return staged_state, local_indices.view_as(cache_indices), (flat_indices, valid_mask)
+
+
+def _glm_restore_padded_conv_state(
+    conv_state: torch.Tensor,
+    staged_state: torch.Tensor,
+    restore_metadata: tuple[torch.Tensor, torch.Tensor] | None,
+) -> None:
+    """把算子更新后的 staged state 拷回真实 cache（同 kimi KDA 做法）。
+
+    回拷形状保持静态以兼容 ACLGraph：无效槽位统一指向 cache line 0，并让其源值等于
+    line 0 本应保留的值。
+    """
+    if restore_metadata is None:
+        return
+
+    flat_indices, valid_mask = restore_metadata
+    safe_indices = flat_indices.masked_fill(~valid_mask, 0).to(torch.long)
+    mask_shape = (valid_mask.numel(),) + (1,) * (staged_state.ndim - 1)
+
+    valid_zero_mask = valid_mask & (flat_indices == 0)
+    updated_zero_state = torch.where(
+        valid_zero_mask.view(mask_shape),
+        staged_state,
+        torch.zeros_like(staged_state),
+    ).sum(dim=0)
+    zero_state = torch.where(
+        valid_zero_mask.any(),
+        updated_zero_state,
+        conv_state[0],
+    )
+    restore_values = torch.where(
+        valid_mask.view(mask_shape),
+        staged_state,
+        zero_state.unsqueeze(0),
+    )
+    conv_state.index_copy_(0, safe_indices, restore_values)
 
 
 def _get_indexer_kpool_mla_backend() -> type[AttentionBackend]:
@@ -1704,6 +1783,133 @@ class AscendGlm5NextLinearAttention(nn.Module, MambaBase):
             num_spec=self.num_spec,
         )
 
+    def _conv_weights_t(self, dtype: torch.dtype) -> torch.Tensor:
+        """按 AscendC CausalConv1d 契约拼权重：[width, 3*dim]（q|k|v 顺序）。
+
+        [dim, 1, width] -> [dim, width] -> [width, dim] -> cat(dim=1)；
+        算子要求 conv 权重 width 维在前，且 x/weight/convStates 的最后一维同 dim。
+        """
+        weights = []
+        for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d):
+            weight = conv.weight.view(conv.weight.size(0), conv.weight.size(2))
+            weights.append(weight.transpose(0, 1))
+        return torch.cat(weights, dim=1).to(dtype=dtype).contiguous()
+
+    def _native_conv1d_usable(self, num_tokens: int, num_reqs: int, conv_dim: int) -> bool:
+        """判断当前步是否满足 AscendC CausalConv1d update 模式的前置条件。
+
+        任何一条不满足都退回旧实现，避免把不支持的形态送进算子：
+          * 每请求恰好 1 个 token（多 token 需要 3D + stateLen >= width-1+seqlen-1，
+            而 GLM 只分配 stateLen = width-1）
+          * dim 必须 16 对齐（算子 tiling 硬约束）
+        """
+        if num_tokens <= 0 or num_tokens != num_reqs:
+            return False
+        if conv_dim % 16 != 0:
+            return False
+        return True
+
+    def _fused_decode_causal_conv1d(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        conv_state: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """decode 阶段 q/k/v 因果卷积 + conv state 更新（单次 AscendC 调用，图安全）。"""
+        qkv_dtype = q.dtype
+        mixed_qkv = torch.cat([q, k, v], dim=-1).contiguous()
+        dim = self.q_conv1d.weight.size(0)
+
+        # 布局守卫：算子要求 convStates = (num_cache_lines, state_len, conv_dim)
+        if conv_state.shape[-1] != mixed_qkv.shape[-1]:
+            raise RuntimeError(
+                "GLM-5 causal conv requires the conv state layout "
+                f"[num_cache_lines, state_len, conv_dim], got {tuple(conv_state.shape)} "
+                f"for qkv dim {mixed_qkv.shape[-1]}"
+            )
+
+        num_reqs = mixed_qkv.shape[0]
+        assert attn_metadata.non_spec_state_indices_tensor is not None
+        cache_indices = attn_metadata.non_spec_state_indices_tensor[:num_reqs]
+
+        staged_state, kernel_cache_indices, restore_metadata = _glm_stage_padded_conv_state(
+            conv_state, cache_indices
+        )
+
+        # dtype 必须三者一致（算子 tiling 校验）；kda_state_dtype 给的就是模型 dtype，
+        # 这里只做防御性对齐。
+        compute_dtype = staged_state.dtype
+        if mixed_qkv.dtype != compute_dtype:
+            mixed_qkv = mixed_qkv.to(compute_dtype)
+
+        out = torch.empty_like(mixed_qkv)
+        torch.ops._C_ascend.npu_causal_conv1d_custom(
+            out,
+            mixed_qkv,
+            self._conv_weights_t(compute_dtype),
+            conv_state=staged_state,
+            bias_opt=None,
+            query_start_loc_opt=None,
+            cache_indices_opt=kernel_cache_indices,
+            initial_state_mode_opt=None,  # runMode=1 不接受该入参
+            num_accepted_tokens_opt=None,  # 每请求 1 token，无需 MTP 接受数
+            activation_mode=1,  # silu
+            pad_slot_id=PAD_SLOT_ID,
+            run_mode=1,  # update：逐请求状态更新
+        )
+        _glm_restore_padded_conv_state(conv_state, staged_state, restore_metadata)
+
+        q_conv, k_conv, v_conv = out.split(dim, dim=-1)
+        if out.dtype != qkv_dtype:
+            q_conv = q_conv.to(qkv_dtype)
+            k_conv = k_conv.to(qkv_dtype)
+            v_conv = v_conv.to(qkv_dtype)
+        return q_conv, k_conv, v_conv
+
+    def _legacy_decode_causal_conv1d(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        conv_state_ds: torch.Tensor,
+        attn_metadata: GDNAttentionMetadata,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """旧实现（逐 token Python 循环 + .item()），仅在算子前置条件不满足时兜底。
+
+        注意：本路径含 host sync，在整图捕获下会触发 EE1016，正常配置不应走到这里。
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        state_len = self.conv_kernel_size - 1
+        conv_state_q, conv_state_k, conv_state_v = conv_state_ds.chunk(3, dim=-2)
+        weights = []
+        for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d):
+            weights.append(conv.weight.view(conv.weight.size(0), conv.weight.size(2)))
+
+        assert attn_metadata.non_spec_state_indices_tensor is not None
+        decode_conv_indices = attn_metadata.non_spec_state_indices_tensor[:num_actual_tokens]
+
+        q_conv = torch.empty_like(q)
+        k_conv = torch.empty_like(k)
+        v_conv = torch.empty_like(v)
+        for x_flat, out_flat, w, cs in [
+            (q, q_conv, weights[0], conv_state_q),
+            (k, k_conv, weights[1], conv_state_k),
+            (v, v_conv, weights[2], conv_state_v),
+        ]:
+            for t in range(num_actual_tokens):
+                slot = int(decode_conv_indices[t].item())
+                x_t = x_flat[t : t + 1, :].unsqueeze(0).transpose(1, 2)
+                cs_t = cs[slot, :, :state_len].unsqueeze(0)
+                conv_input = torch.cat([cs_t, x_t], dim=-1).to(w.dtype)
+                w_3d = w.unsqueeze(1)
+                res = torch.nn.functional.conv1d(conv_input, w_3d, None, padding=0, groups=w.shape[0])
+                res = torch.nn.functional.silu(res[..., -1:])
+                out_flat[t : t + 1, :] = res.squeeze(0).transpose(0, 1).to(dtype=x_flat.dtype)
+                cs[slot, :, :state_len].copy_(conv_input[..., -state_len:].squeeze(0))
+        return q_conv, k_conv, v_conv
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -1746,10 +1952,15 @@ class AscendGlm5NextLinearAttention(nn.Module, MambaBase):
         gate = gate[:num_actual_tokens]
 
         conv_state, recurrent_state = self.kv_cache
-        if not is_conv_state_dim_first():
-            conv_state = conv_state.transpose(-1, -2)
+        # conv_state 原生布局 SD=(state_len, dim)，正是 AscendC CausalConv1d 要求的
+        # (num_cache_lines, state_len, dim)，decode 分支直接使用；prefill 分支沿用
+        # 旧的逐请求循环，需要 DS=(dim, state_len) 视图。
+        if is_conv_state_dim_first():
+            conv_state_ds = conv_state
+        else:
+            conv_state_ds = conv_state.transpose(-1, -2)
 
-        conv_state_q, conv_state_k, conv_state_v = conv_state.chunk(3, dim=-2)
+        conv_state_q, conv_state_k, conv_state_v = conv_state_ds.chunk(3, dim=-2)
 
         q_conv_weights = self.q_conv1d.weight.view(self.q_conv1d.weight.size(0), self.q_conv1d.weight.size(2))
         k_conv_weights = self.k_conv1d.weight.view(self.k_conv1d.weight.size(0), self.k_conv1d.weight.size(2))
@@ -1790,25 +2001,29 @@ class AscendGlm5NextLinearAttention(nn.Module, MambaBase):
             k_conv = k_out.squeeze(0).transpose(0, 1)
             v_conv = v_out.squeeze(0).transpose(0, 1)
         else:
-            decode_conv_indices = non_spec_state_indices_tensor[:num_actual_tokens]
-            q_conv = torch.empty_like(q)
-            k_conv = torch.empty_like(k)
-            v_conv = torch.empty_like(v)
-            for x_flat, out_flat, w, cs in [
-                (q, q_conv, q_conv_weights, conv_state_q),
-                (k, k_conv, k_conv_weights, conv_state_k),
-                (v, v_conv, v_conv_weights, conv_state_v),
-            ]:
-                for t in range(num_actual_tokens):
-                    slot = int(decode_conv_indices[t].item())
-                    x_t = x_flat[t : t + 1, :].unsqueeze(0).transpose(1, 2)
-                    cs_t = cs[slot, :, :state_len].unsqueeze(0)
-                    conv_input = torch.cat([cs_t, x_t], dim=-1).to(w.dtype)
-                    w_3d = w.unsqueeze(1)
-                    res = torch.nn.functional.conv1d(conv_input, w_3d, None, padding=0, groups=w.shape[0])
-                    res = torch.nn.functional.silu(res[..., -1:])
-                    out_flat[t : t + 1, :] = res.squeeze(0).transpose(0, 1).to(dtype=x_flat.dtype)
-                    cs[slot, :, :state_len].copy_(conv_input[..., -state_len:].squeeze(0))
+            # decode：优先走 AscendC CausalConv1d（无 host sync、图捕获安全）。
+            # 旧实现是「每 token 一次 .item() + 逐 token conv」的 Python 循环，在
+            # FULL_DECODE_ONLY 整图捕获下会在捕获态触发同步 D2H（EE1016），并把
+            # 数据相关的 state 槽位固化进图，replay 时写错/越界槽位导致设备侧崩溃
+            # （507035 vector core exception / 507014 aicore timeout）。
+            num_decode_reqs = attn_metadata.num_decodes
+            conv_dim = 3 * self.q_conv1d.weight.size(0)
+            if self._native_conv1d_usable(num_actual_tokens, num_decode_reqs, conv_dim):
+                q_conv, k_conv, v_conv = self._fused_decode_causal_conv1d(
+                    q, k, v, conv_state, attn_metadata
+                )
+            else:
+                if "glm_conv_legacy_fallback" not in _glm_warned_keys:
+                    _glm_warn_once(
+                        "glm_conv_legacy_fallback",
+                        f"GLM-5 decode causal conv fell back to the legacy python loop "
+                        f"(num_actual_tokens={num_actual_tokens}, "
+                        f"num_decodes={num_decode_reqs}, conv_dim={conv_dim}); "
+                        f"this path contains host sync and is not ACLGraph-capture safe.",
+                    )
+                q_conv, k_conv, v_conv = self._legacy_decode_causal_conv1d(
+                    q, k, v, conv_state_ds, attn_metadata
+                )
 
         q_conv = rearrange(q_conv, "n (h d) -> 1 n h d", d=self.head_dim)
         k_conv = rearrange(k_conv, "n (h d) -> 1 n h d", d=self.head_dim)
