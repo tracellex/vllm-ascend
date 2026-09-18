@@ -1305,99 +1305,48 @@ class KVCacheRecvingThread(threading.Thread):
         conv_dtype_size = group_spec["dtype_sizes"][0]
 
         hf_text_config = self.vllm_config.model_config.hf_text_config
-        linear_layout_fields = (
-            "linear_key_head_dim",
-            "linear_num_key_heads",
-            "linear_value_head_dim",
-            "linear_num_value_heads",
-        )
-        if not all(hasattr(hf_text_config, field) for field in linear_layout_fields):
-            model_type = str(getattr(hf_text_config, "model_type", ""))
-            if not model_type.startswith("glm5_next"):
-                missing_fields = [
-                    field for field in linear_layout_fields if not hasattr(hf_text_config, field)
-                ]
+        linear_attn_config = getattr(hf_text_config, "linear_attn_config", None)
+        if linear_attn_config is not None:
+            projection_width = (
+                linear_attn_config["num_heads"]
+                * linear_attn_config["head_dim"]
+            )
+            remote_conv_sizes = [projection_width // remote_tp_size] * 3
+        else:
+            linear_layout_fields = (
+                "linear_key_head_dim",
+                "linear_num_key_heads",
+                "linear_value_head_dim",
+                "linear_num_value_heads",
+            )
+            missing_fields = [
+                field
+                for field in linear_layout_fields
+                if not hasattr(hf_text_config, field)
+            ]
+            if missing_fields:
+                model_type = str(getattr(hf_text_config, "model_type", ""))
                 raise RuntimeError(
                     "Cannot split Mamba cache across TP ranks without a known "
                     f"physical layout: model_type={model_type!r}, missing_fields={missing_fields}."
                 )
 
-            # GLM5Next GDN state is physically TP-sharded by concatenation:
-            # conv is split along its final axis and SSM along its first axis.
-            # Field logs from the deployed model show P(TP4) shapes
-            # (3, 6144)/(16, 128, 128) and D(TP2) shapes
-            # (3, 12288)/(32, 128, 128), respectively. Derive the copy
-            # segments from those per-layer specs instead of borrowing the
-            # MiniMax-M3 K/K/V layout fields.
-            ssm_shape = group_spec["shapes"][1]
-            ssm_dtype_size = group_spec["dtype_sizes"][1]
-            expected_local_conv_len = math.prod(conv_shape) * conv_dtype_size
-            expected_local_ssm_len = math.prod(ssm_shape) * ssm_dtype_size
-            if local_conv_len != expected_local_conv_len or local_ssm_len != expected_local_ssm_len:
-                raise RuntimeError(
-                    "GLM5Next Mamba cache metadata does not match its per-layer spec: "
-                    f"conv_shape={conv_shape}, conv_dtype_size={conv_dtype_size}, "
-                    f"local_conv_len={local_conv_len}, expected_conv_len={expected_local_conv_len}, "
-                    f"ssm_shape={ssm_shape}, ssm_dtype_size={ssm_dtype_size}, "
-                    f"local_ssm_len={local_ssm_len}, expected_ssm_len={expected_local_ssm_len}."
-                )
-            if conv_shape[-1] % tp_ratio != 0 or local_ssm_len % tp_ratio != 0:
-                raise RuntimeError(
-                    "GLM5Next Mamba cache cannot be evenly split across remote TP ranks: "
-                    f"conv_shape={conv_shape}, local_ssm_len={local_ssm_len}, tp_ratio={tp_ratio}."
-                )
+            remote_num_key_heads = hf_text_config.linear_num_key_heads // remote_tp_size
+            remote_num_value_heads = hf_text_config.linear_num_value_heads // remote_tp_size
+            remote_conv_sizes = [
+                remote_num_key_heads * hf_text_config.linear_key_head_dim,
+                remote_num_key_heads * hf_text_config.linear_key_head_dim,
+                remote_num_value_heads * hf_text_config.linear_value_head_dim,
+            ]
 
-            remote_conv_width = conv_shape[-1] // tp_ratio
-            conv_rows = math.prod(conv_shape[:-1])
-            for row_idx in range(conv_rows):
-                local_addr_offset = (
-                    row_idx * conv_shape[-1] + remote_tp_offset * remote_conv_width
-                ) * conv_dtype_size
-                remote_addr_offset = row_idx * remote_conv_width * conv_dtype_size
-                src_list.append(local_conv_addr + local_block_id * local_conv_stride + local_addr_offset)
-                dst_list.append(remote_conv_addr + remote_block_id * remote_conv_stride + remote_addr_offset)
-                length_list.append(remote_conv_width * conv_dtype_size)
-
-            src_list.append(
-                local_ssm_addr
-                + local_block_id * local_ssm_stride
-                + remote_tp_offset * remote_ssm_len
+        remote_conv_width = sum(remote_conv_sizes)
+        remote_conv_offsets = [0, remote_conv_sizes[0], sum(remote_conv_sizes[:2])]
+        expected_local_conv_width = remote_conv_width * tp_ratio
+        if len(conv_shape) != 2 or conv_shape[1] != expected_local_conv_width:
+            raise ValueError(
+                "Mamba unequal-TP transfer only supports SD conv state layout "
+                f"(state_len, dim), got shape={conv_shape}, expected_dim={expected_local_conv_width}."
             )
-            dst_list.append(remote_ssm_addr + remote_block_id * remote_ssm_stride)
-            length_list.append(remote_ssm_len)
-            logger.debug(
-                "Mooncake GLM5Next Mamba TP transfer layout: conv_shape=%s ssm_shape=%s "
-                "tp_ratio=%s remote_tp_offset=%s conv_segments=%s conv_segment_bytes=%s "
-                "ssm_segment_bytes=%s",
-                conv_shape,
-                ssm_shape,
-                tp_ratio,
-                remote_tp_offset,
-                conv_rows,
-                remote_conv_width * conv_dtype_size,
-                remote_ssm_len,
-            )
-            return
-
-        linear_key_head_dim = hf_text_config.linear_key_head_dim
-        linear_num_key_heads = hf_text_config.linear_num_key_heads
-        linear_value_head_dim = hf_text_config.linear_value_head_dim
-        linear_num_value_heads = hf_text_config.linear_num_value_heads
-        remote_num_key_heads = linear_num_key_heads // remote_tp_size
-        remote_num_value_heads = linear_num_value_heads // remote_tp_size
-        remote_conv_width = (
-            remote_num_key_heads * 2 * linear_key_head_dim + remote_num_value_heads * linear_value_head_dim
-        )
-        remote_conv_offsets = [
-            0,
-            remote_num_key_heads * linear_key_head_dim,
-            remote_num_key_heads * 2 * linear_key_head_dim,
-        ]
-        remote_conv_sizes = [
-            remote_num_key_heads * linear_key_head_dim,
-            remote_num_key_heads * linear_key_head_dim,
-            remote_num_value_heads * linear_value_head_dim,
-        ]
 
         for i in range(conv_shape[0]):
             for remote_conv_offset, remote_conv_size in zip(remote_conv_offsets, remote_conv_sizes):

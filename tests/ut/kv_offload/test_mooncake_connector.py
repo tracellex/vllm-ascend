@@ -299,6 +299,91 @@ class TestKVCacheSendingThread(unittest.TestCase):
 
 
 class TestMooncakeTransferGroups(unittest.TestCase):
+    def test_glm_mamba_unequal_tp_interleaves_qkv_shards(self):
+        thread = KVCacheRecvingThread.__new__(KVCacheRecvingThread)
+        thread.tp_size = 4
+        thread.vllm_config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(
+                hf_text_config=types.SimpleNamespace(
+                    model_type="glm5_next_text",
+                    linear_attn_config={"num_heads": 64, "head_dim": 128},
+                )
+            )
+        )
+
+        local_conv_addr = 100_000
+        local_ssm_addr = 200_000
+        remote_conv_addr = 300_000
+        remote_ssm_addr = 400_000
+        conv_dtype_size = 2
+        local_conv_width = 6_144
+        remote_conv_width = 3_072
+        remote_segment_width = 1_024
+        state_len = 3
+        local_ssm_len = 16 * 128 * 128 * 4
+
+        group_spec = {
+            "shapes": ((state_len, local_conv_width), (16, 128, 128)),
+            "dtype_sizes": (conv_dtype_size, 4),
+        }
+
+        for remote_tp_offset in range(2):
+            src_list: list[int] = []
+            dst_list: list[int] = []
+            length_list: list[int] = []
+            thread._append_mamba_transfer_meta(
+                src_list,
+                dst_list,
+                length_list,
+                group_spec=group_spec,
+                src_layer_base_addr=[local_conv_addr, local_ssm_addr],
+                dst_layer_base_addr=[remote_conv_addr, remote_ssm_addr],
+                block_len=[
+                    state_len * local_conv_width * conv_dtype_size,
+                    local_ssm_len,
+                ],
+                block_stride=[
+                    state_len * local_conv_width * conv_dtype_size,
+                    local_ssm_len,
+                ],
+                remote_block_stride=[
+                    state_len * remote_conv_width * conv_dtype_size,
+                    local_ssm_len // 2,
+                ],
+                remote_block_id=0,
+                local_block_id=0,
+                tp_num_need_pulls=2,
+                remote_tp_offset=remote_tp_offset,
+            )
+
+            expected_src = []
+            expected_dst = []
+            expected_lengths = []
+            for row_idx in range(state_len):
+                for segment_idx in range(3):
+                    expected_src.append(
+                        local_conv_addr
+                        + (
+                            row_idx * local_conv_width
+                            + segment_idx * 2 * remote_segment_width
+                            + remote_tp_offset * remote_segment_width
+                        )
+                        * conv_dtype_size
+                    )
+                    expected_dst.append(
+                        remote_conv_addr
+                        + (row_idx * remote_conv_width + segment_idx * remote_segment_width)
+                        * conv_dtype_size
+                    )
+                    expected_lengths.append(remote_segment_width * conv_dtype_size)
+            expected_src.append(local_ssm_addr + remote_tp_offset * local_ssm_len // 2)
+            expected_dst.append(remote_ssm_addr)
+            expected_lengths.append(local_ssm_len // 2)
+
+            self.assertEqual(src_list, expected_src)
+            self.assertEqual(dst_list, expected_dst)
+            self.assertEqual(length_list, expected_lengths)
+
     def test_attention_group_uses_explicit_total_heads_for_unequal_pd_tp(self):
         worker = MooncakeConnectorWorker.__new__(MooncakeConnectorWorker)
         worker.num_key_value_heads = 16
