@@ -706,9 +706,9 @@ class NPUModelRunner(GPUModelRunner):
         if self.dp_size == 1:
             return num_tokens, None, cudagraph_mode
 
-        if should_skip_allreduce_across_dp_group(self.vllm_config, is_draft_model):
-            num_tokens_after_padding = torch.tensor([num_tokens] * self.dp_size, device="cpu", dtype=torch.int32)
-            return num_tokens, num_tokens_after_padding, cudagraph_mode
+        skip_dp_padding = should_skip_allreduce_across_dp_group(
+            self.vllm_config, is_draft_model
+        )
 
         # On certain devices, CPU-side all_reduce may return dirty data. 
         # When dp_allreduce_on_npu is True, route DP metadata
@@ -729,6 +729,12 @@ class NPUModelRunner(GPUModelRunner):
         num_tokens_across_dp = packed_tensor[0, :]
         max_tokens_across_dp = int(num_tokens_across_dp.max().item())
         synced_cudagraph_mode = CUDAGraphMode(_post_process_cudagraph_mode(packed_tensor))
+
+        # Uneven-token MC2 accepts different local token counts, but all DP
+        # ranks must still select the same graph mode. Mixing FULL replay with
+        # PIECEWISE/eager execution can desynchronize global EP collectives.
+        if skip_dp_padding:
+            return num_tokens, num_tokens_across_dp.cpu(), synced_cudagraph_mode
 
         # Create a tensor for num_tokens_after_padding
         if allow_dp_padding or is_draft_model:
