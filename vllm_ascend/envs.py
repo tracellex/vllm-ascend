@@ -110,6 +110,16 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Escape hatch: keep async scheduling enabled even with DP>1 + expert
+    # parallel + MoE on a PD KV-consumer node (uneven-token MC2 path).
+    # Async scheduling lets DP ranks diverge on whether a target forward is
+    # entered at a decode step boundary, which deadlocks the global-EP
+    # collective sequence under concurrency (see Case 11 in
+    # docs/glm-5.3-flash/investigations/pd-concurrency-hang-debug.md).
+    # Enabling this reintroduces that correctness risk.
+    "VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2", "0"))
+    ),
 }
 
 # end-env-vars-definition

@@ -447,6 +447,44 @@ class NPUPlatform(Platform):
         )
 
     @classmethod
+    def _fix_async_scheduling_for_dp_ep_moe(cls, vllm_config: VllmConfig) -> None:
+        from vllm_ascend import envs as ascend_envs
+
+        scheduler_config = vllm_config.scheduler_config
+        parallel_config = vllm_config.parallel_config
+        kv_transfer_config = vllm_config.kv_transfer_config
+        # Covers kv_role='kv_consumer' and 'kv_both'; non-PD DP+EP deployments
+        # keep the DP padding path and stay structurally safe with async
+        # scheduling, so they must not be force-disabled here.
+        is_kv_consumer = kv_transfer_config is not None and getattr(
+            kv_transfer_config, "is_kv_consumer", False
+        )
+        if (
+            scheduler_config.async_scheduling
+            and parallel_config.data_parallel_size > 1
+            and parallel_config.enable_expert_parallel
+            and vllm_config.model_config.is_moe
+            and is_kv_consumer
+            and not ascend_envs.VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2
+        ):
+            logger.warning(
+                "Async scheduling is force-disabled on Ascend: with DP>1 + "
+                "expert parallel + MoE on a PD KV-consumer node, the "
+                "uneven-token MC2 path lets DP ranks diverge on whether a "
+                "target forward is entered at a decode step boundary, "
+                "deadlocking the global-EP collective sequence under "
+                "concurrency. parameter=async_scheduling, action: resetting "
+                "to False. Set VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2=1 "
+                "to override (correctness risk)."
+            )
+            scheduler_config.async_scheduling = False
+            # NOTE: VllmConfig.__post_init__ already resolved this flag while
+            # async scheduling was still enabled (the resolution happens
+            # before the platform hook runs), so re-align it explicitly with
+            # the sync-scheduling semantics.
+            parallel_config.disable_nccl_for_dp_synchronization = False
+
+    @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
         from vllm_ascend.quantization.utils import maybe_auto_detect_quantization
 
@@ -468,6 +506,7 @@ class NPUPlatform(Platform):
         cls._validate_draft_decode_context_parallel_config(vllm_config)
         cls._validate_parallel_config(vllm_config)
         cls._validate_pd_pp_mtp_config(vllm_config)
+        cls._fix_async_scheduling_for_dp_ep_moe(vllm_config)
 
         # initialize ascend config from vllm additional_config
         cls._fix_incompatible_config(vllm_config)
