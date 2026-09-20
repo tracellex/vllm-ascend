@@ -2059,6 +2059,19 @@ class NPUModelRunner(GPUModelRunner):
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
                 if (scheduler_output.total_num_scheduled_tokens <= 0
                         or not tokens or sum(tokens) == 0):
+                    # EngineCore reports model_executed=True from
+                    # total_num_scheduled_tokens > 0, so the busy loop will
+                    # NOT run execute_dummy_batch() for this step. If the
+                    # persistent batch is nevertheless empty, this DP rank
+                    # must still join the DP metadata all-reduce and the
+                    # global-EP MC2 collective sequence, otherwise ranks
+                    # that do run a forward deadlock in the collective.
+                    # Mirrors the external_launcher corner case handled above.
+                    if self.parallel_config.data_parallel_size > 1:
+                        self._dummy_run(
+                            num_tokens=self.decode_token_per_req,
+                            uniform_decode=True,
+                        )
                     if not has_kv_transfer_group():
                         return EMPTY_MODEL_RUNNER_OUTPUT
                     return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
