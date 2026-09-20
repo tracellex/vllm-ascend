@@ -3530,6 +3530,11 @@ class NPUModelRunner(GPUModelRunner):
                 self.num_decode_draft_tokens.copy_to_gpu()
                 self.num_accepted_tokens.copy_to_gpu()
 
+            if not is_graph_capturing:
+                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
+                    blk_table = self.input_batch.block_table[kv_cache_gid]
+                    blk_table.slot_mapping.gpu.fill_(-1)
+
             pad_attn = cudagraph_runtime_mode == CUDAGraphMode.FULL
             # check how to build dummy
             if self.use_compress:
@@ -3546,10 +3551,6 @@ class NPUModelRunner(GPUModelRunner):
                 num_scheduled_tokens_np=num_scheduled_tokens,
                 use_spec_decode=use_spec_decode,
             )
-            if not is_graph_capturing:
-                for kv_cache_gid in range(len(self.kv_cache_config.kv_cache_groups)):
-                    blk_table = self.input_batch.block_table[kv_cache_gid]
-                    blk_table.slot_mapping.gpu.fill_(-1)
 
         with self.maybe_dummy_run_with_lora(
             self.lora_config,
