@@ -23,6 +23,9 @@ import functools
 import json
 import math
 import os
+import threading
+import time
+import urllib.request
 from contextlib import nullcontext
 from enum import Enum
 from functools import lru_cache
@@ -78,6 +81,41 @@ _CUSTOM_OP_VENDOR_DIR = "custom_transformer"
 _CUSTOM_OP_BASE_DIR = (
     os.path.dirname(__file__) if os.path.isabs(__file__) else os.path.abspath(os.path.dirname(__file__))
 )
+
+
+# #region debug-point A:remote-event-reporter
+def _report_pd_hang_debug_event(
+    hypothesis_id: str,
+    location: str,
+    msg: str,
+    data: dict,
+    trace_id: str | None = None,
+) -> None:
+    payload = {
+        "sessionId": "pd-concurrency-hang",
+        "runId": "pre-fix",
+        "hypothesisId": hypothesis_id,
+        "ts": time.time_ns() // 1_000_000,
+        "location": location,
+        "msg": f"[DEBUG] {msg}",
+        "data": data,
+    }
+    if trace_id is not None:
+        payload["traceId"] = trace_id
+
+    def _post() -> None:
+        try:
+            request = urllib.request.Request(
+                "http://192.168.32.39:7777/event",
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            urllib.request.urlopen(request, timeout=0.5).read()
+        except Exception:
+            pass
+
+    threading.Thread(target=_post, daemon=True).start()
+# #endregion
 
 
 def extract_dsv4_layer_index(config: Any, layer_name: str) -> int:

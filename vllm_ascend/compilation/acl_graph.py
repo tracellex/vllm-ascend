@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import dataclasses
+import time
 import weakref
 from collections.abc import Callable
 from contextlib import ExitStack
@@ -22,7 +23,7 @@ from vllm.platforms import current_platform
 
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 
-from ..utils import weak_ref_tensors
+from ..utils import _report_pd_hang_debug_event, weak_ref_tensors
 
 _acl_graph_wrappers: weakref.WeakSet[Any] = weakref.WeakSet()
 _STREAM_RESOURCE_ERROR_CODE = "207008"
@@ -252,9 +253,57 @@ class ACLGraphWrapper:
         # When FULL + EAGLE draft (merge path), replay does not need this barrier.
         is_draft_eagle = _EXTRA_CTX.is_draft_model and self.use_eagle
         need_sync = self.runtime_mode == CUDAGraphMode.FULL and not is_draft_eagle
+        # #region debug-point C:full-graph-replay
+        debug_trace_id = None
+        debug_now = time.monotonic()
+        if (
+            self.runtime_mode == CUDAGraphMode.FULL
+            and debug_now - getattr(self, "_debug_last_replay_report_time", 0.0)
+            >= 0.25
+        ):
+            self._debug_last_replay_report_time = debug_now
+            debug_rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else -1
+            )
+            debug_trace_id = f"replay-{debug_rank}-{time.monotonic_ns()}"
+            _report_pd_hang_debug_event(
+                "C",
+                "acl_graph.py:ACLGraphWrapper.__call__",
+                "Before full graph replay barrier",
+                {
+                    "rank": debug_rank,
+                    "batch_descriptor": str(batch_descriptor),
+                    "need_sync": need_sync,
+                    "is_draft_model": _EXTRA_CTX.is_draft_model,
+                },
+                debug_trace_id,
+            )
+        # #endregion
         if not self.enable_enpu and need_sync:
             torch.npu.current_stream().synchronize()
+        # #region debug-point C:full-graph-replay
+        if debug_trace_id is not None:
+            _report_pd_hang_debug_event(
+                "C",
+                "acl_graph.py:ACLGraphWrapper.__call__",
+                "After full graph replay barrier",
+                {"rank": debug_rank},
+                debug_trace_id,
+            )
+        # #endregion
         entry.aclgraph.replay()
+        # #region debug-point C:full-graph-replay
+        if debug_trace_id is not None:
+            _report_pd_hang_debug_event(
+                "C",
+                "acl_graph.py:ACLGraphWrapper.__call__",
+                "After full graph replay",
+                {"rank": debug_rank},
+                debug_trace_id,
+            )
+        # #endregion
         return entry.output
 
 

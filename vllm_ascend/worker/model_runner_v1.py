@@ -163,6 +163,7 @@ from vllm_ascend.utils import (
     kv_cache_spec_uses_sparse_sfa_c8,
     lmhead_tp_enable,
     oproj_tp_enable,
+    _report_pd_hang_debug_event,
     set_potential_max_tokens,
     set_weight_prefetch_method,
     should_skip_allreduce_across_dp_group,
@@ -2964,6 +2965,8 @@ class NPUModelRunner(GPUModelRunner):
             )
 
         cudagraph_mode, batch_descriptor = dispatch_cudagraph(num_tokens_padded, use_cascade_attn or has_encoder_output)
+        local_cudagraph_mode = cudagraph_mode
+        local_batch_descriptor = batch_descriptor
         num_tokens_padded = batch_descriptor.num_tokens
         if enable_sp(self.vllm_config):
             assert batch_descriptor.num_tokens % self.vllm_config.parallel_config.tensor_parallel_size == 0, (
@@ -2994,6 +2997,49 @@ class NPUModelRunner(GPUModelRunner):
                 # Assert to make sure the agreed upon token count is correct otherwise
                 # num_tokens_across_dp will no-longer be valid
                 assert batch_descriptor.num_tokens == num_tokens_padded
+        # #region debug-point A:batch-execution-mode
+        debug_now = time.monotonic()
+        debug_signature = (
+            str(local_cudagraph_mode),
+            local_batch_descriptor.num_tokens,
+            str(cudagraph_mode),
+            batch_descriptor.num_tokens,
+            num_reqs,
+            is_all_decode,
+            uniform_decode,
+        )
+        if get_tp_group().rank_in_group == 0 and (
+            debug_signature != getattr(self, "_debug_last_batch_signature", None)
+            or debug_now - getattr(self, "_debug_last_batch_report_time", 0.0) >= 1.0
+        ):
+            self._debug_last_batch_signature = debug_signature
+            self._debug_last_batch_report_time = debug_now
+            _report_pd_hang_debug_event(
+                "A",
+                "model_runner_v1.py:_determine_batch_execution_and_padding",
+                "Batch execution mode selected",
+                {
+                    "dp_rank": self.dp_rank,
+                    "num_tokens": num_tokens,
+                    "num_reqs": num_reqs,
+                    "scheduled_tokens": num_scheduled_tokens_np.tolist(),
+                    "is_all_decode": is_all_decode,
+                    "uniform_decode": uniform_decode,
+                    "skip_dp_sync": should_skip_allreduce_across_dp_group(
+                        self.vllm_config
+                    ),
+                    "local_mode": str(local_cudagraph_mode),
+                    "local_batch_tokens": local_batch_descriptor.num_tokens,
+                    "final_mode": str(cudagraph_mode),
+                    "final_batch_tokens": batch_descriptor.num_tokens,
+                    "tokens_across_dp": (
+                        None
+                        if num_tokens_across_dp is None
+                        else num_tokens_across_dp.tolist()
+                    ),
+                },
+            )
+        # #endregion
         cudagraph_stats = None
         if self.vllm_config.observability_config.cudagraph_metrics:
             cudagraph_stats = CUDAGraphStat(

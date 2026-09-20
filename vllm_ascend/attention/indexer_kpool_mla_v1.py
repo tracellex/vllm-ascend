@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import torch
@@ -32,12 +33,14 @@ from vllm_ascend.core.kv_cache_interface import (
     format_indexer_kpool_slot_mapping,
 )
 from vllm_ascend.device.device_op import DeviceOperator
+from vllm_ascend.utils import _report_pd_hang_debug_event
 
 INDEXER_KPOOL_MLA_SPARSE_ATTN_QUERY_CHUNK_SIZE = 16
 INDEXER_KPOOL_MLA_SAS_METADATA_SIZE = 1024
 GLM5_SFA_KERNEL_BLOCK_SIZE = 128
 INDEXER_KPOOL_MAX_BLOCK_SIZE = 1024
 INDEXER_KPOOL_BLOCK_ALIGNMENT = 16
+_DEBUG_LAST_SCATTER_REPORT: dict[int, float] = {}
 
 
 def select_indexer_block_size(storage_block_size: int) -> tuple[int, int]:
@@ -685,7 +688,45 @@ class AscendIndexerKPoolMLAImpl(AscendSFAImpl):
             return
         valid_rows = (
             (slots >= 0) & (slots < cache.shape[0] * block_size)
-        ).nonzero().flatten()
+        )
+        # #region debug-point B:eager-indexer-nonzero
+        debug_rank = (
+            torch.distributed.get_rank()
+            if torch.distributed.is_initialized()
+            else -1
+        )
+        debug_now = time.monotonic()
+        debug_trace_id = None
+        if debug_now - _DEBUG_LAST_SCATTER_REPORT.get(debug_rank, 0.0) >= 1.0:
+            _DEBUG_LAST_SCATTER_REPORT[debug_rank] = debug_now
+            debug_trace_id = f"scatter-{debug_rank}-{time.monotonic_ns()}"
+            _report_pd_hang_debug_event(
+                "B",
+                "indexer_kpool_mla_v1.py:_scatter_paged_cache",
+                "Before eager slot nonzero",
+                {
+                    "rank": debug_rank,
+                    "mode": str(get_forward_context().cudagraph_runtime_mode),
+                    "slots_shape": tuple(slots.shape),
+                    "values_shape": tuple(values.shape),
+                    "cache_shape": tuple(cache.shape),
+                    "block_size": block_size,
+                },
+                debug_trace_id,
+            )
+        valid_rows = valid_rows.nonzero().flatten()
+        if debug_trace_id is not None:
+            _report_pd_hang_debug_event(
+                "B",
+                "indexer_kpool_mla_v1.py:_scatter_paged_cache",
+                "After eager slot nonzero",
+                {
+                    "rank": debug_rank,
+                    "valid_rows": valid_rows.numel(),
+                },
+                debug_trace_id,
+            )
+        # #endregion
         if valid_rows.numel() == 0:
             return
         valid_slots = slots[valid_rows]
