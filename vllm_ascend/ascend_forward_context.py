@@ -88,6 +88,13 @@ def set_ascend_forward_context(
     }
     with set_forward_context(**forward_context_kwargs):
         forward_context = get_forward_context()
+        # Diagnostic-only identifiers used by the opt-in MC2 sequence tracer.
+        # A target forward uses -1; draft forwards update spec_step_idx before
+        # each MTP pass.
+        forward_context.mc2_trace_forward_id = None
+        forward_context.mc2_trace_forward_op_seq = 0
+        forward_context.spec_step_idx = 0 if is_draft_model else -1
+        forward_context.mc2_trace_layer = None
         forward_context.draft_attn_metadatas = draft_attn_metadatas
 
         forward_context.input_ids = input_ids

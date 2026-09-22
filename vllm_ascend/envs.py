@@ -120,6 +120,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2", "0"))
     ),
+    # Diagnostic-only MC2 sequence tracing. "1" logs every dispatch/combine
+    # boundary; "0" disables tracing. The value contains no sensitive data.
+    "VLLM_ASCEND_TRACE_MC2_SEQUENCE": lambda: bool(int(os.getenv("VLLM_ASCEND_TRACE_MC2_SEQUENCE", "0"))),
 }
 
 # end-env-vars-definition

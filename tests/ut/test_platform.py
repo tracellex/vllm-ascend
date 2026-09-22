@@ -1,4 +1,5 @@
 import importlib
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -78,6 +79,36 @@ class TestNPUPlatform(TestBase):
         self.assertEqual(NPUPlatform.device_control_env_var, "ASCEND_RT_VISIBLE_DEVICES")
         self.assertEqual(NPUPlatform.dispatch_key, "PrivateUse1")
         self.assertEqual(NPUPlatform.supported_quantization, [ASCEND_QUANTIZATION_METHOD, COMPRESSED_TENSORS_METHOD])
+
+    @patch("vllm_ascend.envs.VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2", False)
+    def test_force_disables_async_scheduling_for_pd_dp_ep_moe_consumer(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.scheduler_config.async_scheduling = True
+        vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.parallel_config.enable_expert_parallel = True
+        vllm_config.parallel_config.disable_nccl_for_dp_synchronization = True
+        vllm_config.model_config.is_moe = True
+        vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True)
+
+        self.platform._fix_async_scheduling_for_dp_ep_moe(vllm_config)
+
+        self.assertFalse(vllm_config.scheduler_config.async_scheduling)
+        self.assertFalse(vllm_config.parallel_config.disable_nccl_for_dp_synchronization)
+
+    @patch("vllm_ascend.envs.VLLM_ASCEND_ALLOW_ASYNC_SCHEDULING_WITH_MC2", True)
+    def test_async_scheduling_escape_hatch_preserves_config(self):
+        vllm_config = self.mock_vllm_config()
+        vllm_config.scheduler_config.async_scheduling = True
+        vllm_config.parallel_config.data_parallel_size = 4
+        vllm_config.parallel_config.enable_expert_parallel = True
+        vllm_config.parallel_config.disable_nccl_for_dp_synchronization = True
+        vllm_config.model_config.is_moe = True
+        vllm_config.kv_transfer_config = SimpleNamespace(is_kv_consumer=True)
+
+        self.platform._fix_async_scheduling_for_dp_ep_moe(vllm_config)
+
+        self.assertTrue(vllm_config.scheduler_config.async_scheduling)
+        self.assertTrue(vllm_config.parallel_config.disable_nccl_for_dp_synchronization)
 
     def test_is_sleep_mode_available(self):
         self.assertTrue(self.platform.is_sleep_mode_available())

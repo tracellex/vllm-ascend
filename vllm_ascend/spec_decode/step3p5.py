@@ -527,6 +527,9 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
     ) -> torch.Tensor:
         """Base MTP execution flow with Step3.5 step-aware layer/head selection."""
         self._last_draft_probs = None
+        forward_context = get_forward_context()
+        if forward_context is not None:
+            forward_context.spec_step_idx = 0
         sampling_metadata = self.runner.input_batch.sampling_metadata
         model_input_ids = self.input_ids[:num_input_tokens]
         model_positions = self._get_positions(num_input_tokens)
@@ -653,6 +656,8 @@ class AscendStep3p5MTPProposer(AscendEagleProposer):
                 forward_context.moe_layer_index = 0
 
             spec_step_idx = draft_step + 1
+            if forward_context is not None:
+                forward_context.spec_step_idx = spec_step_idx
             prev_token_ids = self.input_ids[:num_tokens].clone()
             next_token_ids = draft_token_ids_list[-1].int()
             inputs_embeds = self._roll_window_inputs_only(

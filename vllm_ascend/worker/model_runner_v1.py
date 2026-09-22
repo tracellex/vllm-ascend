@@ -1920,6 +1920,13 @@ class NPUModelRunner(GPUModelRunner):
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
 
+    def _should_run_empty_batch_dummy(self) -> bool:
+        """Return whether this worker owns the empty-batch dummy forward."""
+        return (
+            self.parallel_config.data_parallel_size > 1
+            and not self.use_async_scheduling
+        )
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -2057,8 +2064,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_reqs = self.input_batch.num_reqs
                 req_ids = self.input_batch.req_ids
                 tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
-                if (scheduler_output.total_num_scheduled_tokens <= 0
-                        or not tokens or sum(tokens) == 0):
+                if not tokens or sum(tokens) == 0:
                     # EngineCore reports model_executed=True from
                     # total_num_scheduled_tokens > 0, so the busy loop will
                     # NOT run execute_dummy_batch() for this step. If the
@@ -2067,7 +2073,7 @@ class NPUModelRunner(GPUModelRunner):
                     # global-EP MC2 collective sequence, otherwise ranks
                     # that do run a forward deadlock in the collective.
                     # Mirrors the external_launcher corner case handled above.
-                    if self.parallel_config.data_parallel_size > 1:
+                    if self._should_run_empty_batch_dummy():
                         self._dummy_run(
                             num_tokens=self.decode_token_per_req,
                             uniform_decode=True,

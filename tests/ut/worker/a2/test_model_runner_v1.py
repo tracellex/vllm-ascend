@@ -22,6 +22,29 @@ from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestNPUModelRunnerEmptyBatchDummy(unittest.TestCase):
+    def _build_runner(self, data_parallel_size: int, async_scheduling: bool):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.parallel_config = SimpleNamespace(data_parallel_size=data_parallel_size)
+        runner.use_async_scheduling = async_scheduling
+        return runner
+
+    def test_sync_dp_worker_runs_empty_batch_dummy(self):
+        runner = self._build_runner(data_parallel_size=4, async_scheduling=False)
+
+        self.assertTrue(runner._should_run_empty_batch_dummy())
+
+    def test_async_dp_worker_does_not_run_worker_side_dummy(self):
+        runner = self._build_runner(data_parallel_size=4, async_scheduling=True)
+
+        self.assertFalse(runner._should_run_empty_batch_dummy())
+
+    def test_single_dp_worker_does_not_run_empty_batch_dummy(self):
+        runner = self._build_runner(data_parallel_size=1, async_scheduling=False)
+
+        self.assertFalse(runner._should_run_empty_batch_dummy())
+
+
 class TestNPUModelRunnerKVCache(unittest.TestCase):
     def _build_runner(self):
         runner = NPUModelRunner.__new__(NPUModelRunner)

@@ -15,6 +15,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, PropertyMock, patch
 
 import numpy as np
@@ -173,6 +174,47 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertTrue(self.dispatcher.enable_dispatch_v2)
         self.assertTrue(self.dispatcher.need_extra_args)
         self.assertEqual(self.dispatcher.global_bs, 0)
+
+    @patch("vllm_ascend.ops.fused_moe.token_dispatcher.logger.warning")
+    @patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.get_tp_group",
+        return_value=SimpleNamespace(rank_in_group=0),
+    )
+    @patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.get_dp_group",
+        return_value=SimpleNamespace(rank_in_group=0),
+    )
+    @patch(
+        "vllm_ascend.ops.fused_moe.token_dispatcher.torch.npu.current_stream",
+        return_value=SimpleNamespace(npu_stream=7),
+    )
+    def test_trace_collective_assigns_forward_id_lazily(
+        self,
+        _mock_current_stream,
+        _mock_dp_group,
+        _mock_tp_group,
+        mock_warning,
+    ):
+        self.dispatcher._trace_mc2 = True
+        context = SimpleNamespace(
+            in_profile_run=False,
+            mc2_trace_forward_id=None,
+            mc2_trace_forward_op_seq=0,
+            is_draft_model=False,
+        )
+        tensor = torch.zeros((2, 4))
+
+        with patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.get_forward_context",
+            return_value=context,
+        ):
+            self.dispatcher._trace_collective("before", "dispatch", tensor)
+            self.dispatcher._trace_collective("after", "dispatch", tensor)
+
+        self.assertEqual(context.mc2_trace_forward_id, 1)
+        self.assertEqual(context.mc2_trace_forward_op_seq, 1)
+        self.assertEqual(self.dispatcher._mc2_collective_seq, 1)
+        self.assertEqual(mock_warning.call_count, 2)
 
     def test_init_uses_mc2_capacity_for_non_uniform_global_bs(self):
         self.mock_get_config.return_value.parallel_config.tensor_parallel_size = 4

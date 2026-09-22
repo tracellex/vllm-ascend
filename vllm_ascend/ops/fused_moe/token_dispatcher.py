@@ -26,8 +26,11 @@ from typing import Generic
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
+from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
 from vllm_ascend.device.device_op import DeviceOperator
@@ -109,6 +112,9 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
         self.ep_rank_id = get_mc2_group().rank_in_group
         self.ep_world_size = get_mc2_group().world_size
+        self._trace_mc2 = ascend_envs.VLLM_ASCEND_TRACE_MC2_SEQUENCE
+        self._mc2_collective_seq = 0
+        self._mc2_trace_forward_seq = 0
         self.enable_dispatch_v2 = hasattr(torch_npu, "npu_moe_distribute_dispatch_v2")
         self.need_extra_args = get_ascend_device_type() in [AscendDeviceType.A3, AscendDeviceType.A5]
         self.a5_need_extra_args = get_ascend_device_type() == AscendDeviceType.A5
@@ -146,6 +152,45 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         local_rank = torch.distributed.get_rank(group=device_group)
         backend = device_group._get_backend(torch.device("npu"))
         self.moe_all_to_all_group_name = backend.get_hccl_comm_name(local_rank)
+
+    def _trace_collective(self, boundary: str, op: str, tensor: torch.Tensor) -> None:
+        if not self._trace_mc2:
+            return
+        context = get_forward_context()
+        if getattr(context, "in_profile_run", False):
+            return
+        if boundary == "before":
+            self._mc2_collective_seq += 1
+            context.mc2_trace_forward_op_seq += 1
+            if context.mc2_trace_forward_id is None:
+                self._mc2_trace_forward_seq += 1
+                context.mc2_trace_forward_id = self._mc2_trace_forward_seq
+        stream = torch.npu.current_stream()
+        logger.warning(
+            "MC2SEQ boundary=%s op=%s seq=%d forward_op_seq=%d global_rank=%d dp_rank=%d "
+            "tp_rank=%d ep_rank=%d forward_id=%s phase=%s draft_step=%s "
+            "layer=%s comm_type=%s local_tokens=%d padded_tokens=%s "
+            "shape=%s dtype=%s stream=%s global_bs=%d",
+            boundary,
+            op,
+            self._mc2_collective_seq,
+            context.mc2_trace_forward_op_seq,
+            torch.distributed.get_rank(),
+            get_dp_group().rank_in_group,
+            get_tp_group().rank_in_group,
+            self.ep_rank_id,
+            getattr(context, "mc2_trace_forward_id", None),
+            "draft" if getattr(context, "is_draft_model", False) else "target",
+            getattr(context, "spec_step_idx", None),
+            getattr(context, "mc2_trace_layer", None),
+            getattr(getattr(context, "moe_comm_type", None), "name", None),
+            tensor.shape[0],
+            getattr(context, "padded_num_tokens", None),
+            tuple(tensor.shape),
+            tensor.dtype,
+            getattr(stream, "npu_stream", stream),
+            self.global_bs,
+        )
 
     def get_dispatch_mc2_kwargs(
         self,
@@ -227,11 +272,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         token_dispatch_input: MoETokenDispatchInput,
     ):
         kwargs_mc2 = self.get_dispatch_mc2_kwargs(token_dispatch_input)
+        self._trace_collective("before", "dispatch", token_dispatch_input.hidden_states)
         output = (
             torch_npu.npu_moe_distribute_dispatch_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_dispatch(**kwargs_mc2)
         )
+        self._trace_collective("after", "dispatch", token_dispatch_input.hidden_states)
         # comm_stream.wait_stream(torch.npu.current_stream())
         (
             expand_x,
@@ -330,11 +377,13 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
         assert bias is None, "Bias is not supported in MoEAlltoAllvTokenDispatcher."
 
         kwargs_mc2 = self.get_combine_mc_kwargs(hidden_states, combine_metadata)
+        self._trace_collective("before", "combine", hidden_states)
         combined_output = (
             torch_npu.npu_moe_distribute_combine_v2(**kwargs_mc2)
             if self.enable_dispatch_v2
             else torch_npu.npu_moe_distribute_combine(**kwargs_mc2)
         )
+        self._trace_collective("after", "combine", hidden_states)
 
         return combined_output
 

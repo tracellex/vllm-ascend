@@ -586,6 +586,9 @@ else:
             self, hidden_states: torch.Tensor, router_logits: torch.Tensor, return_with_event: bool = False
         ) -> torch.Tensor | FusedMoEResult:
             forward_context = get_forward_context()
+            # Attribute the next MC2 dispatch/combine pair to the exact model
+            # layer without changing operator inputs or scheduling.
+            forward_context.mc2_trace_layer = self.layer_name
             # When static kernels are enabled, the forward pass runs twice (compilation + capture),
             # causing moe_layer_index to overflow. Wrap the index to prevent out-of-bounds errors.
             if self.enable_npugraph_ex_static_kernel and forward_context.all_moe_layers:
