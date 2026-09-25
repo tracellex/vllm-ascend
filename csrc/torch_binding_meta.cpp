@@ -259,7 +259,7 @@ std::tuple<at::Tensor, at::Tensor> npu_glm5_kpool_indexer_meta(
                 "topk_tokens (", topk_tokens, ") must be positive and divisible by kpool (", kpool, ").");
 
     c10::SymDimVector indicesSize = {qbar.sym_size(DIM_0), c10::SymInt(1),
-                                     c10::SymInt(topk_tokens + kpool - 1)};
+                                     c10::SymInt(topk_tokens / kpool)};
     at::Tensor indices_out =
         at::empty_symint(indicesSize, qbar.options().dtype(at::kInt));
     at::Tensor scores_debug_out;

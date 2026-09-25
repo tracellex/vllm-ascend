@@ -56,6 +56,7 @@ public:
     static constexpr uint64_t L0C_BUFFER_OFFSET = M_BLOCK * S2_BLOCK;
 
     static constexpr uint64_t FP16_BLOCK_CUBE = 16;
+    static constexpr AscendC::IsResetLoad3dConfig LOAD3DV2_CONFIG = {true, true}; // isSetFMatrix isSetPadding;
 
 protected:
     __aicore__ inline void Fixp(const RunInfo &runInfo);
@@ -181,33 +182,49 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::KeyNd2NzForPA(const RunInfo &r
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceCube<Q_T>::LoadQueryToL0a(const RunInfo &runInfo)
 {
+    // arch22 A0 loads MUST use the 3D (fmatrix) form: the arch35-style
+    // LoadData2DParamsV2 path hangs the MTE1 queue on this core generation.
     (void)runInfo;
-    LoadData2DParamsV2 loadData2DParamsV2;
-    loadData2DParamsV2.mStartPosition = 0;
-    loadData2DParamsV2.kStartPosition = 0;
-    loadData2DParamsV2.mStep = CeilDiv(M_BLOCK, BLOCK_CUBE);
-    loadData2DParamsV2.kStep = CeilDiv(constInfo_.headDim, FP16_BLOCK_CUBE);
-    loadData2DParamsV2.srcStride = CeilDiv(M_BLOCK, BLOCK_CUBE);
-    loadData2DParamsV2.dstStride = CeilDiv(M_BLOCK, BLOCK_CUBE);
-    loadData2DParamsV2.ifTranspose = false;
-    LoadData(queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
-             queryL1_[(queryL1Mte1BufIdx_ % QUERY_BUF_NUM) * QUERY_BUFFER_OFFSET], loadData2DParamsV2);
+    LoadData3DParamsV2<Q_T> loadData3DParams;
+    loadData3DParams.l1H = CeilDiv(M_BLOCK, BLOCK_CUBE); // Hin = M1 blocks
+    loadData3DParams.l1W = BLOCK_CUBE;                   // Win = M0
+    loadData3DParams.channelSize = constInfo_.headDim;   // Cin = K
+    loadData3DParams.padList[0] = 0;
+    loadData3DParams.padList[1] = 0;
+    loadData3DParams.padList[2] = 0;
+    loadData3DParams.padList[3] = 255;
+    loadData3DParams.mExtension = CeilAlign(M_BLOCK, (uint64_t)BLOCK_CUBE);
+    loadData3DParams.kExtension = constInfo_.headDim;
+    loadData3DParams.mStartPt = 0;
+    loadData3DParams.kStartPt = 0;
+    loadData3DParams.strideW = 1;
+    loadData3DParams.strideH = 1;
+    loadData3DParams.filterW = 1;
+    loadData3DParams.filterSizeW = (1 >> 8) & 255;
+    loadData3DParams.filterH = 1;
+    loadData3DParams.filterSizeH = (1 >> 8) & 255;
+    loadData3DParams.dilationFilterW = 1;
+    loadData3DParams.dilationFilterH = 1;
+    loadData3DParams.enTranspose = 0;
+    loadData3DParams.fMatrixCtrl = 0;
+    LoadData<Q_T, LOAD3DV2_CONFIG>(queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
+                                   queryL1_[(queryL1Mte1BufIdx_ % QUERY_BUF_NUM) * QUERY_BUFFER_OFFSET],
+                                   loadData3DParams);
 }
 
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceCube<Q_T>::LoadKeyToL0b(const RunInfo &runInfo)
 {
+    // arch22 B0 uses the legacy 1D LoadData2DParams form (v1 arch22 pattern).
     (void)runInfo;
-    LoadData2DParamsV2 loadData2DParamsV2;
-    loadData2DParamsV2.mStartPosition = 0;
-    loadData2DParamsV2.kStartPosition = 0;
-    loadData2DParamsV2.mStep = CeilDiv(S2_BLOCK, BLOCK_CUBE);
-    loadData2DParamsV2.kStep = CeilDiv(constInfo_.headDim, FP16_BLOCK_CUBE);
-    loadData2DParamsV2.srcStride = CeilDiv(S2_BLOCK, BLOCK_CUBE);
-    loadData2DParamsV2.dstStride = CeilDiv(S2_BLOCK, BLOCK_CUBE);
-    loadData2DParamsV2.ifTranspose = false;
+    LoadData2DParams loadData2DParams;
+    loadData2DParams.startIndex = 0;
+    loadData2DParams.repeatTimes = CeilDiv(S2_BLOCK, BLOCK_CUBE) * CeilDiv(constInfo_.headDim, BLOCK_CUBE);
+    loadData2DParams.srcStride = 1;
+    loadData2DParams.dstGap = 0;
+    loadData2DParams.ifTranspose = false;
     LoadData(keyL0_[(kl0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
-             keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET], loadData2DParamsV2);
+             keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET], loadData2DParams);
 }
 
 template <typename Q_T>
@@ -215,14 +232,18 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeL0c(const RunInfo &runI
 {
     (void)runInfo;
     MmadParams mmadParams;
-    mmadParams.m = M_BLOCK;
+    mmadParams.m = CeilAlign(M_BLOCK, (uint64_t)BLOCK_CUBE);
     mmadParams.n = S2_BLOCK;
     mmadParams.k = constInfo_.headDim;
     mmadParams.cmatrixInitVal = true;
     mmadParams.cmatrixSource = false;
+    mmadParams.unitFlag = 0b11;
     Mmad(cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
          queryL0_[(l0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET],
          keyL0_[(kl0BufIdx_ % L0_BUF_NUM) * L0AB_BUFFER_OFFSET], mmadParams);
+    if ((mmadParams.m / 16) * (mmadParams.n / 16) < 10) {
+        PipeBarrier<PIPE_M>();
+    }
 }
 
 template <typename Q_T>
@@ -252,6 +273,7 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
     KeyNd2NzForPA(runInfo);
     SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
     WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+    AscendC::PRINTF("CUBE-KEY loop=%u\n", runInfo.loop);
 
     queryL1Mte2BufIdx_++;
     queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
@@ -259,13 +281,23 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
     QueryNd2Nz(runInfo);
     SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
     WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
+    AscendC::PRINTF("CUBE-QUERY loop=%u\n", runInfo.loop);
 
 #if GLMK_CUBE_STAGE >= 3
-    WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
+    // The AllocEventID pre-set of M_MTE1 never fires on this stack when the M
+    // queue has no activity yet; the first L0_BUF_NUM blocks own a clean L0,
+    // so skipping the wait there removes the dependency on that pre-set.
+    if (l0BufIdx_ >= L0_BUF_NUM) {
+        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
+    }
     LoadQueryToL0a(runInfo);
+    AscendC::PRINTF("CUBE-LQA loop=%u\n", runInfo.loop);
     LoadKeyToL0b(runInfo);
+    AscendC::PRINTF("CUBE-LKB loop=%u\n", runInfo.loop);
     SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+    AscendC::PRINTF("CUBE-SETM1 loop=%u\n", runInfo.loop);
     WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
+    AscendC::PRINTF("CUBE-LOAD loop=%u\n", runInfo.loop);
 
     ComputeL0c(runInfo);
     SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
@@ -273,6 +305,7 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
 
 #if GLMK_CUBE_STAGE >= 4
     Fixp(runInfo);
+    AscendC::PRINTF("CUBE-FIXP loop=%u\n", runInfo.loop);
 #endif
     l0BufIdx_++;
     kl0BufIdx_++;

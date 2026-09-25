@@ -54,6 +54,32 @@ def _pad_positions(positions: torch.Tensor) -> torch.Tensor:
     return positions
 
 
+def _expand_pool_ids(pool_ids: torch.Tensor, positions: torch.Tensor, index_topk: int,
+                     index_kpool: int) -> torch.Tensor:
+    """Pool ids -> token indices, mirroring the Triton wrapper post-processing.
+
+    history: pid*kpool + {0..kpool-1}, -1 padded to index_topk columns; the
+    causal tail (kpool-1 columns) mirrors the Triton operator's fixed tail
+    block (append_causal_tail on the model side is idempotent over it).
+    """
+    num_tokens = pool_ids.shape[0]
+    device = pool_ids.device
+    pool_topk = pool_ids.shape[1]
+    lane = torch.arange(index_kpool, device=device)
+    hist = pool_ids.unsqueeze(-1) * index_kpool + lane  # [T, poolTopk, kpool]
+    hist = torch.where((pool_ids < 0).unsqueeze(-1), torch.full_like(hist, -1), hist)
+    hist = hist.reshape(num_tokens, index_topk)
+    if pool_topk * index_kpool < index_topk:
+        hist = torch.nn.functional.pad(hist, (0, index_topk - pool_topk * index_kpool), value=-1)
+
+    tail_cols = torch.arange(index_kpool - 1, device=device)
+    tail_start = (positions + 1) // index_kpool * index_kpool
+    tail = torch.where(tail_cols.unsqueeze(0) < (positions + 1 - tail_start).unsqueeze(1),
+                       tail_start.unsqueeze(1) + tail_cols.unsqueeze(0),
+                       torch.full((num_tokens, index_kpool - 1), -1, dtype=torch.long, device=device))
+    return torch.cat([hist, tail.to(hist.dtype)], dim=1).view(num_tokens, 1, -1)
+
+
 def glm5_kpool_indexer(
     query: torch.Tensor,
     indexer_cache: torch.Tensor,
@@ -110,8 +136,8 @@ def glm5_kpool_indexer(
                 index_kpool=index_kpool, max_pool_seq_len=max_pool_seq_len,
             )
         qbar = _compute_qbar(query, weights.to(query.dtype))
-        positions_pad = _pad_positions(positions)
-        indices, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
+        positions_pad = _pad_positions(positions.to(torch.int32))
+        pool_ids, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
             qbar,
             indexer_cache,
             cum_query_lens,
@@ -124,7 +150,14 @@ def glm5_kpool_indexer(
             max_pool_seq_len,
             0,
         )
-        return indices[:query.shape[0]]
+        pool_ids = pool_ids[:query.shape[0], 0]  # [T, poolTopk]
+        # kernel ships raw ids: mask sentinel / beyond-visibility lanes here.
+        visible = torch.minimum((positions + 1) // index_kpool,
+                                indexer_seq_lens.clamp_min(0).to(torch.int64))
+        visible = torch.minimum(visible, torch.tensor(max_pool_seq_len, device=pool_ids.device))
+        pool_ids = torch.where(pool_ids < visible, pool_ids,
+                               torch.full_like(pool_ids, -1))
+        return _expand_pool_ids(pool_ids, positions, index_topk, index_kpool)
 
     return glm5_next_lightning_indexer_triton(
         query, indexer_cache, weights, cum_query_lens, indexer_seq_lens,

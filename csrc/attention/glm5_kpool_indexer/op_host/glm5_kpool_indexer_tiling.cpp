@@ -101,8 +101,8 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(info.qbarType != ge::DT_BF16 && info.qbarType != ge::DT_FLOAT16,
                 OP_LOGE(opName, "qbar dtype must be bf16/fp16."), return ge::GRAPH_FAILED);
-    OP_CHECK_IF(context->GetInputDesc(POSITIONS_INDEX)->GetDataType() != ge::DT_INT64,
-                OP_LOGE(opName, "positions must be int64."), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(context->GetInputDesc(POSITIONS_INDEX)->GetDataType() != ge::DT_INT32,
+                OP_LOGE(opName, "positions must be int32."), return ge::GRAPH_FAILED);
     return ge::GRAPH_SUCCESS;
 }
 

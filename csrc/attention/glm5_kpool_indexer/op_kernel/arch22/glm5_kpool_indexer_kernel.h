@@ -240,7 +240,7 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
         vectorService.InitParams(constInfo_);
         vectorService.InitInputTensor(*reinterpret_cast<GlobalTensor<int32_t> *>(&indicesOut),
                                       *reinterpret_cast<GlobalTensor<float> *>(&scoresDebugOut),
-                                      *reinterpret_cast<GlobalTensor<int64_t> *>(&positions), cumQueryLensGm,
+                                      *reinterpret_cast<GlobalTensor<int32_t> *>(&positions), cumQueryLensGm,
                                       indexerSeqLensGm, mm1ResGm);
     } else {
         matmulService.InitParams(constInfo_);
@@ -279,18 +279,21 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
         runInfo.isValid = true;
 
         if ASCEND_IS_AIC {
+            AscendC::PRINTF("AIC-PREWAIT loop=%u\n", runInfo.loop);
             CrossCoreWaitFlag(syncV1C1_);
-#if GLMK_DEBUG_STAGE >= 2
+            AscendC::PRINTF("AIC-MM1-BEGIN loop=%u\n", runInfo.loop);
             matmulService.ComputeMm1(runInfo);
-#endif
+            AscendC::PRINTF("AIC-MM1-DONE loop=%u\n", runInfo.loop);
             CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_FIX>(syncC1V1_);
+            AscendC::PRINTF("AIC-SETFLAG loop=%u\n", runInfo.loop);
         } else {
+            AscendC::PRINTF("AIV-PREWAIT loop=%u\n", runInfo.loop);
             CrossCoreWaitFlag(syncC1V1_);
+            AscendC::PRINTF("AIV-POSTWAIT loop=%u\n", runInfo.loop);
             vectorService.ProcessVec(runInfo);
+            AscendC::PRINTF("AIV-VEC-DONE loop=%u\n", runInfo.loop);
             if (runInfo.isLastS2InnerLoop) {
-#if GLMK_EMIT
                 vectorService.ProcessTopK(runInfo);
-#endif
             }
             CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
         }
@@ -306,10 +309,13 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Process()
     }
 
     if ASCEND_IS_AIV {
+        AscendC::PRINTF("AIV-PROC-START aiv=%u\n", GetBlockIdx());
         vectorService.AllocEventID();
+        AscendC::PRINTF("AIV-ALLOC-EV aiv=%u\n", GetBlockIdx());
         // prime the handshake: cube may compute block 0 immediately
         CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
         CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
+        AscendC::PRINTF("AIV-PRIMED aiv=%u\n", GetBlockIdx());
     } else {
         matmulService.AllocEventID();
     }

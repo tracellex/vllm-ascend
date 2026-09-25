@@ -48,10 +48,11 @@ public:
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        // [numTokens] absolute token positions (int64 from vLLM).
+        // [numTokens] absolute token positions (int32 cast by the wrapper:
+        // AIV scalar reads of int64 GM fault on this stack).
         this->Input("positions")
             .ParamType(REQUIRED)
-            .DataTypeList({ge::DT_INT64})
+            .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
         // [numTokens, 1, topkTokens + kpool - 1] selected token indices, -1 padded.

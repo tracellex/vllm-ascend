@@ -19,7 +19,7 @@ inline std::tuple<at::Tensor, at::Tensor> construct_glm5_kpool_indexer_output_te
     TORCH_CHECK(topkTokens > 0 && kpool > 0 && topkTokens % kpool == 0,
                 "topk_tokens (", topkTokens, ") must be positive and divisible by kpool (", kpool, ").");
 
-    int64_t outputWidth = topkTokens + kpool - 1;
+    int64_t poolTopk = topkTokens / kpool; // raw pool ids; expansion in python
     at::Tensor indicesOut = at::empty({qbar.size(DIM_0), 1, outputWidth}, qbar.options().dtype(at::kInt));
     at::Tensor scoresDebugOut;
     if (outputMode == 1) {
@@ -40,7 +40,7 @@ inline std::tuple<at::Tensor, at::Tensor> npu_glm5_kpool_indexer(
     TORCH_CHECK(indexerCache.is_contiguous(), "indexer_cache must be contiguous [blocks, poolsPerBlock, 1, headDim].");
     TORCH_CHECK(qbar.scalar_type() == at::kBFloat16 || qbar.scalar_type() == at::kHalf, "qbar dtype must be bf16/fp16.");
     TORCH_CHECK(qbar.scalar_type() == indexerCache.scalar_type(), "qbar and indexer_cache dtypes must match.");
-    TORCH_CHECK(positions.scalar_type() == at::kLong, "positions must be int64.");
+    TORCH_CHECK(positions.scalar_type() == at::kInt, "positions must be int32.");
 
     auto outputs = construct_glm5_kpool_indexer_output_tensor(qbar, positions, topkTokens, kpool, maxPoolSeqLen,
                                                               outputMode);
