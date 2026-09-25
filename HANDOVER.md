@@ -35,6 +35,48 @@ c. 引擎侧过 → diff 构建容器与引擎容器（env/设备 cgroup/so 加�
 `GLMK_DEBUG_STAGE` 控早退；每轮实验先容器 root 清
 `csrc/build/binary/ascend910_93/{src,bin,gen}/*glm5*` 再编。
 
+## 2026-09-25 深夜 Claude 第二轮（commit 80fbd0e66）——AIC 已打通，AIV 定位到 int64 GM 标量读
+
+**重大突破（AscendC::PRINTF 上设备追踪，ASCENDC_DEBUG 已在 op_host/CMakeLists 常开）**：
+
+1. **AIC 挂死根因落定并修复**：arch22 上 L1→L0 装载必须用 v1 arch22 原生形式——
+   **A0 用 `LoadData3D`（LoadData3DParamsV2 + `LOAD3DV2_CONFIG` fmatrix 配置）**、
+   **B0 用旧版 `LoadData2DParams`（startIndex/repeatTimes/srcStride/dstGap）**。
+   我们此前误用 arch35 风格的 `LoadData2DParamsV2`，会把 MTE1 队列永久挂死。
+   修复后 AIC 全链（KeyNd2Nz→Mmad(unitFlag=0b11+小块PipeBarrier)→NZ2ND Fixp）
+   设备 trace 全通，锁步推进到 AIV。
+2. **aivector fault（"scalar access internal buffer OOB"）精确定位进 LoadRowMeta**：
+   trace 显示 `seqLensGm.GetValue`(int32) 过、16 次 `positionsGm.GetValue`(int64) 循环挂 →
+   **AIV 上 int64 GM 标量读是高嫌疑** → 已把 positions 全链改为 int32
+   （def/tiling/torch_adpt/kernel GlobalTensor<int32_t>；python wrapper `.to(torch.int32)`）。
+   **注意：.so 因 bgmv 缓存残留没重链成功，当前冒烟 exit=1 是旧 .so 的
+   "positions must be int64" 报错——清 `build/temp.linux-aarch64-cpython-312`
+   后重链即可验证 int32 是否解决（重链已在跑/或需 codex 重做）**。
+3. **EmitRow 已重写为纯向量版**：标量 `GetValue/SetValue`（UB）会编译成向量粒度访问、
+   非对齐偏移越界 → 改 `ExtractIndex`（GatherMask）抽 512 个 pool id 原样 CopyOut；
+   **×4 展开 + 可见性过滤 + causal tail 全部移到 python wrapper**
+   （`vllm_ascend/ops/glm5_kpool_indexer.py` 的 `_expand_pool_ids` + `torch.where(ids<visible)`）。
+   **算子输出契约变为 [T, 1, poolTopk=512] 原始 pool id**（infershape/torch_adpt/meta 同步改）。
+4. 其他已固化修复：Fixp 固定 S2_TILE 宽（尾块对齐宽挂）；InitSortOutBuf 分块 ≤127 repeats；
+   前 L0_BUF_NUM 块跳过 M_MTE1 wait（AllocEventID 预置在该栈不触发）。
+
+**codex 下一步（按序）**：
+1. 清 `build/temp.linux-aarch64-cpython-312` 重链 .so（宿主上跑会因 root 属主失败，
+   须容器内）→ 跑 `/tmp/smoke_ac_only.py` 验证 int32 positions 后 AIV 是否过 LRM；
+   若仍挂：在 positions 循环内逐 r 加 PRINTF，或改 DataCopy(pos 16×i32) 进 UB 后向量算
+   visible（彻底消灭 AIV GM 标量读）。
+2. AIV 过后跑 `/tmp/smoke_m2.py` 对拍 triton（sort 后集合精确 + tail/-1 逐元素；
+   现在输出走 python 展开，直接比 [T,1,2051] 终态即可）。
+3. 语义复核（用户要求）：对照 `vllm_ascend/ops/triton/glm5_next_lightning_indexer.py`
+   逐条核对（qbar 权重域 fp32、visible=min((pos+1)//kpool, seq_pool, maxPool)、
+   -1 padding 语义、tail 位置 min(causal,2048)、`append_causal_tail` 幂等）。
+4. 性能（用户强调必须显著优于 triton）：M3 清单在 HANDOVER 下文。
+
+**现场**：构建容器现为 **glm-5.3-flash-a3-main 镜像 @ davinci15**（用户指定用
+glm-5.3-flash 容器）；每轮实验前容器 root 清
+`csrc/build/binary/ascend910_93/{src,bin,gen}/*glm5*`；.so 用
+`rm -rf build/temp* && python3 setup.py build_ext --inplace`（bgmv 残留会假失败）。
+
 ## 任务一句话
 
 用 AscendC 算子 `Glm5KpoolIndexer`（fused 打分+topk+展开+tail）替换 glm5.3-flash 的
