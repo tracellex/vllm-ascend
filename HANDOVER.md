@@ -61,8 +61,13 @@ c. 引擎侧过 → diff 构建容器与引擎容器（env/设备 cgroup/so 加�
    前 L0_BUF_NUM 块跳过 M_MTE1 wait（AllocEventID 预置在该栈不触发）。
 
 **codex 下一步（按序）**：
-1. 清 `build/temp.linux-aarch64-cpython-312` 重链 .so（宿主上跑会因 root 属主失败，
-   须容器内）→ 跑 `/tmp/smoke_ac_only.py` 验证 int32 positions 后 AIV 是否过 LRM；
+0. **.so 重链被 bgmv 卡死（本镜像可复现）**：glm-5.3-flash-a3-main 镜像下
+   `setup.py build_ext` 的 `vllm_ascend_kernels_preprocess`（bgmv_expand.cpp）报
+   "unknown file type"——M1 的可用 .so 是 **41run 镜像**容器构建的。workaround：
+   用 `quay.io/ascend/vllm-ascend:glm53-a3-41run` 起临时容器（同挂载）只跑
+   `python3 setup.py build_ext --inplace` 出 .so，再回本镜像跑冒烟；或查 bgmv 构建
+   参数差异。**OPP（算子 kernel）不受影响**——build_aclnn 在本镜像已 BUILD-OK。
+1. 跑 `/tmp/smoke_ac_only.py` 验证 int32 positions 后 AIV 是否过 LRM；
    若仍挂：在 positions 循环内逐 r 加 PRINTF，或改 DataCopy(pos 16×i32) 进 UB 后向量算
    visible（彻底消灭 AIV GM 标量读）。
 2. AIV 过后跑 `/tmp/smoke_m2.py` 对拍 triton（sort 后集合精确 + tail/-1 逐元素；
