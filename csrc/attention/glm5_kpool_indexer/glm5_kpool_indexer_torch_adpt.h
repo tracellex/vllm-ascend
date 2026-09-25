@@ -20,7 +20,7 @@ inline std::tuple<at::Tensor, at::Tensor> construct_glm5_kpool_indexer_output_te
                 "topk_tokens (", topkTokens, ") must be positive and divisible by kpool (", kpool, ").");
 
     int64_t poolTopk = topkTokens / kpool; // raw pool ids; expansion in python
-    at::Tensor indicesOut = at::empty({qbar.size(DIM_0), 1, outputWidth}, qbar.options().dtype(at::kInt));
+    at::Tensor indicesOut = at::empty({qbar.size(DIM_0), 1, poolTopk}, qbar.options().dtype(at::kInt));
     at::Tensor scoresDebugOut;
     if (outputMode == 1) {
         scoresDebugOut = at::empty({qbar.size(DIM_0), maxPoolSeqLen}, qbar.options().dtype(at::kFloat));
