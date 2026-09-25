@@ -12,8 +12,8 @@ from torch import nn
 from vllm_ascend.ops.triton.glm5_next_kpool_tail_compress import (  # type: ignore[import-untyped]
     glm5_next_kpool_tail_compress_and_write_cache_triton,
 )
-from vllm_ascend.ops.triton.glm5_next_lightning_indexer import (  # type: ignore[import-untyped]
-    glm5_next_lightning_indexer_triton,
+from vllm_ascend.ops.glm5_kpool_indexer import (  # type: ignore[import-untyped]
+    glm5_kpool_indexer,
 )
 
 if TYPE_CHECKING:
@@ -127,7 +127,7 @@ class SparseAttnIndexerKpool(nn.Module):
             return None
         if q_values is None or weights is None:
             raise ValueError("GLM KPool top-k requires query and head weights.")
-        indices = glm5_next_lightning_indexer_triton(
+        indices = glm5_kpool_indexer(
             q_values,
             indexer_cache,
             weights.to(q_values.dtype),

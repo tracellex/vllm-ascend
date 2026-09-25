@@ -39,6 +39,7 @@
 #include "gmm/grouped_matmul_swiglu_quant_weight_nz_tensor_list/grouped_matmul_swiglu_quant_torch_adpt.h"
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
+#include "attention/glm5_kpool_indexer/glm5_kpool_indexer_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
@@ -3135,6 +3136,18 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> (Tensor sparse_indices, Tensor sparse_values)"
     );
     ops.impl("npu_lightning_indexer", torch::kPrivateUse1, &vllm_ascend::npu_lightning_indexer);
+
+    // GLM-Next KPool lightning indexer: fused score + pool top-k + token
+    // expansion + causal tail over the paged compressed-K pool cache.
+    ops.def(
+        "npu_glm5_kpool_indexer("
+            "Tensor qbar, Tensor indexer_cache, Tensor cum_query_lens, "
+            "Tensor indexer_seq_lens, Tensor indexer_block_table, Tensor positions, "
+            "int topk_tokens, int kpool, int head_dim, int max_pool_seq_len, "
+            "int output_mode=0"
+        ") -> (Tensor indices, Tensor scores_debug)"
+    );
+    ops.impl("npu_glm5_kpool_indexer", torch::kPrivateUse1, &vllm_ascend::glm5_kpool::npu_glm5_kpool_indexer);
 
     // k2q_csr: q2k -> k2q CSR (Meta/Hist/RowPrefix/TilePrefix/Scatter)
     ops.def(

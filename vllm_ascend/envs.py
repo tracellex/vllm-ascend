@@ -87,6 +87,12 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # GLM-Next KPool lightning indexer implementation selector.
+    # "auto" (default): use the fused AscendC operator when the custom op is
+    # available, falling back to the Triton path otherwise; "triton": force the
+    # Triton path; "ascendc": force the fused AscendC operator (error if the
+    # custom op is unavailable). Valid values: auto/triton/ascendc. Not sensitive.
+    "VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL": lambda: os.getenv("VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL", "auto"),
 }
 
 # end-env-vars-definition
