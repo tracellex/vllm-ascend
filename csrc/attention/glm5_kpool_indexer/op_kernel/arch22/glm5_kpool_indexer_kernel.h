@@ -31,6 +31,12 @@ using namespace Glm5KpoolCommon;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
+// Deadlock bisect gate for the AIV pipeline (packed multi-request hang):
+// 3 = Vec only (skip TopK/Emit), 2 = LoadRowMeta only (skip Fold), 4 = full.
+#ifndef GLMK_STAGE_GATE
+#define GLMK_STAGE_GATE 4
+#endif
+
 template <typename Q_T>
 class Glm5KpoolIndexerKernel {
 public:
@@ -291,10 +297,14 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
             CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_FIX>(syncC1V1_);
         } else {
             CrossCoreWaitFlag(syncC1V1_);
+#if GLMK_STAGE_GATE >= 2
             vectorService.ProcessVec(runInfo);
+#endif
+#if GLMK_STAGE_GATE >= 4
             if (runInfo.isLastS2InnerLoop) {
                 vectorService.ProcessTopK(runInfo);
             }
+#endif
             CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
         }
         loop++;

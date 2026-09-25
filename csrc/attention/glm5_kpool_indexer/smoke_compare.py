@@ -134,6 +134,14 @@ def compare(ref, test, name, dump_rows=4):
 CASES = {
     # non-multiple-of-32 T exercises the pad path; few pools < pool_topk
     "tiny": (lambda: build_inputs([33], 32, 128, seed=1)),
+    # two requests: isolates reqIdx>0 paths from 3-way core spread
+    "packed2": (lambda: build_inputs([64, 100], 32, 64, seed=5)),
+    # two requests, one unit each: the minimal multi-request shape
+    "packed2x1": (lambda: build_inputs([32, 32], 32, 64, seed=6)),
+    # unit-count ladder for the multi-request deadlock trigger
+    "packed3u": (lambda: build_inputs([64, 32], 32, 64, seed=7)),
+    "packed4u": (lambda: build_inputs([64, 64], 32, 64, seed=8)),
+    "packed3eq": (lambda: build_inputs([32, 32, 32], 32, 64, seed=9)),
     # packed multi-request with unequal lengths and per-request tails
     "packed3": (lambda: build_inputs([64, 100, 37], 32, 64, seed=2)),
     # single long request, pools span many blocks through the shuffled table

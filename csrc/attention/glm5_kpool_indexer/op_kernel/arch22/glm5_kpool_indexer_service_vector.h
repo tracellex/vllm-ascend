@@ -214,12 +214,13 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     // debug mode: persist raw fp32 scores
     if (constInfo_.outputMode == 1 && validLanes > 0) {
         uint32_t rowGlobal = runInfo.mStart + rowInTile;
-        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
+        SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
+        WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT); // scoreUb written (V drained)
+        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT); // prior copy done (buffer reusable)
         Glm5KpoolVec::CopyOut(scoresDebugGm[static_cast<uint64_t>(rowGlobal) * constInfo_.maxPoolSeqLen +
                                             runInfo.s2Start],
                               scoreUb_, validLanes);
-        SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
-        WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
+        SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
     }
 
     // fold into the running top-k: MergeSort keeps the best poolTopk pairs.
@@ -261,9 +262,12 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, c
                                static_cast<int64_t>(poolTopk_));
     PipeBarrier<PIPE_V>();
 
+    // Cross-queue handoff outUb_ (V writes) -> MTE3 (CopyOut): the set/wait
+    // pairs carry the queue direction; wait for the prior row's copy before
+    // reusing the single outUb_.
     SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
-    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
-    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
+    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT); // outUb_ written (V drained)
+    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT); // prior row's copy done
     Glm5KpoolVec::CopyOut(indicesOutGm[static_cast<uint64_t>(rowGlobal) * constInfo_.poolTopk],
                           outUb_, constInfo_.poolTopk);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
