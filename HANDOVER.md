@@ -4,6 +4,37 @@
 > `/home/ascend/.claude/plans/glm5-3-flash-profiling-glm5-next-lightn-giggly-gosling.md`
 > （含完整背景/里程碑/验证口径，先读它）。
 
+## 2026-09-25 晚间 Claude 复核（commit 3476b4513）——hang 根因逼近环境层
+
+在 codex 静态修正基础上完成 10+ 轮可信二分（gate 全部置于文件顶部，修复此前
+宏定义晚于使用导致的假标签；codex 的 host 侧契约改动整体 stash 于
+`stash@{0}: codex-host-changes-bisect`）。新事实链：
+
+1. **AIC 段完全健康**：Nd2Nz/Mmad/Fixp（固定 S2_TILE 宽）+ AIV 早退 → 全过。
+   尾块对齐宽（8/16/32）的 Fixp 会挂，已固定为 128 全宽（越界 lane 由 AIV 行级
+   mask 消解）。
+2. **codex kernel.h 的 SetGlobalBuffer 化是独立坏因子**（同组合 reinterpret_cast
+   版过、SetGlobalBuffer 版挂）——已回退为 reinterpret_cast（vendored v1 同款）。
+3. **AIV 段：一条最普通的无 mask `Duplicate`（64 元素）即挂**。InitSortOutBuf 的
+   255-repeats 与 mask 形式均不是根因（分块/1-repeat 同挂）。
+4. **排除环境噪声**：换 davinci15、重启容器、dmesg 均无改善；
+   **torch 自带 vector op（同为 AIV V-pipe 指令）在同一容器正常**；
+   **vendored v1（官方代码 + 本 worktree 自编 OPP）同样 507035/挂**。
+5. 结论：**自编 OPP 的 AIV 段在本构建容器跨算子系统性挂**（自编 glm5 与自编 v1
+   都挂；镜像内置 OPP 的 torch op 正常）。疑点收敛到自编 OPP 与该容器 runtime 的
+   组合（编译产物 ABI / so 加载路径 / 进程上下文），而非算子代码本身。
+
+**下一步（按优先级）**：
+a. **R14（herd 单测容器入口）是正解**：用 npuctl 起标准引擎侧容器，跑自编 OPP 的
+   最小冒烟（一条 Duplicate 的 MIX kernel），判定容器上下文是否分界；
+b. 引擎侧也挂 → 携「单 Duplicate 复现 + torch vector 正常」对照提华为工单；
+c. 引擎侧过 → diff 构建容器与引擎容器（env/设备 cgroup/so 加载），逐项对齐。
+
+工具与现场：冒烟 `/tmp/smoke_ac_only.py`（容器 davinci15）；gate 宏在
+`arch22/glm5_kpool_indexer_service_vector.h` 顶部（GLMK_LRM/COPY/VOPS/EMIT），
+`GLMK_DEBUG_STAGE` 控早退；每轮实验先容器 root 清
+`csrc/build/binary/ascend910_93/{src,bin,gen}/*glm5*` 再编。
+
 ## 任务一句话
 
 用 AscendC 算子 `Glm5KpoolIndexer`（fused 打分+topk+展开+tail）替换 glm5.3-flash 的
