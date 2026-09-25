@@ -77,7 +77,16 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
                 OP_LOGE(opName, "Shape of output indices is nullptr"), return ge::GRAPH_FAILED);
     const gert::StorageShape &indicesShape = *context->GetOutputShape(INDICES_INDEX);
     info.tSize = static_cast<uint32_t>(indicesShape.GetStorageShape().GetDim(0));
-    info.bSize = static_cast<uint32_t>(cumShape.GetStorageShape().GetDim(0));
+    // cum_query_lens / indexer_seq_lens arrive gather-mirrored to stride 8
+    // ([8B] with element i at 32B-aligned offset 8*i): the AIV scalar GM read
+    // faults at non-32B-aligned offsets, so the wrapper mirrors both arrays
+    // and the kernel reads GetValue(idx * 8).
+    const int64_t cumDim0 = cumShape.GetStorageShape().GetDim(0);
+    OP_CHECK_IF(cumDim0 <= 0 || cumDim0 % 8 != 0,
+                OP_LOGE(opName, "cum_query_lens dim0(%ld) must be a positive multiple of 8 (gather layout).",
+                        cumDim0),
+                return ge::GRAPH_FAILED);
+    info.bSize = static_cast<uint32_t>(cumDim0 / 8);
     info.poolsPerBlock = static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(1));
     info.numCacheBlocks = static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(0));
     info.blockTableStride = static_cast<uint32_t>(blockTableShape.GetStorageShape().GetDim(1));
@@ -87,8 +96,9 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
     info.poolTopk = info.topkTokens / info.kpool;
     info.outputWidth = info.topkTokens + info.kpool - 1;
     info.outputMode = (outputMode == nullptr) ? 0U : static_cast<uint32_t>(*outputMode);
-    OP_CHECK_IF(info.bSize == 0 || seqShape.GetStorageShape().GetDim(0) != static_cast<int64_t>(info.bSize),
-                OP_LOGE(opName, "batch size invalid."), return ge::GRAPH_FAILED);
+    OP_CHECK_IF(info.bSize == 0 || seqShape.GetStorageShape().GetDim(0) != cumDim0,
+                OP_LOGE(opName, "batch size invalid (indexer_seq_lens must match the gather layout)."),
+                return ge::GRAPH_FAILED);
     OP_CHECK_IF(info.poolsPerBlock == 0 || info.blockTableStride == 0,
                 OP_LOGE(opName, "poolsPerBlock/blockTableStride invalid."), return ge::GRAPH_FAILED);
     OP_CHECK_IF(static_cast<uint32_t>(qbarShape.GetStorageShape().GetDim(1)) != HEAD_DIM_LIMIT ||

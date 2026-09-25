@@ -19,7 +19,7 @@ using namespace AscendC;
 
 constexpr int32_t NEG_INF = 0xFF800000;
 constexpr int32_t INVALID_INDEX = -1;
-constexpr uint8_t VEC_REPEAT_MAX = 255;
+constexpr uint8_t VEC_REPEAT_MAX = 127;
 constexpr uint8_t B32_VEC_ELM_NUM = 64;
 constexpr uint8_t B32_BLOCK_ALIGN_NUM = 8;
 constexpr uint8_t B32_VEC_REPEAT_STRIDE = 8;
@@ -52,9 +52,20 @@ __aicore__ inline void CopyOut(const GlobalTensor<T> &dstGm, const LocalTensor<T
  */
 __aicore__ inline void InitSortOutBuf(const LocalTensor<float> &src, int64_t eleNum)
 {
-    (void)eleNum;
     uint64_t mask1[2] = {0x5555555555555555, 0};
-    AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1, 1, 1, B32_VEC_REPEAT_STRIDE);
+    uint64_t mask0[2] = {0xaaaaaaaaaaaaaaaa, 0};
+    int64_t repeatNum = eleNum / B32_VEC_ELM_NUM;
+    int64_t repeatOffset = 0;
+    while (repeatOffset < repeatNum) {
+        int64_t remaining = repeatNum - repeatOffset;
+        uint8_t repeatCount = static_cast<uint8_t>(remaining > VEC_REPEAT_MAX ? VEC_REPEAT_MAX : remaining);
+        int64_t elementOffset = repeatOffset * B32_VEC_ELM_NUM;
+        auto chunk = src.template ReinterpretCast<int32_t>()[elementOffset];
+        AscendC::Duplicate(chunk, NEG_INF, mask1, repeatCount, 1, B32_VEC_REPEAT_STRIDE);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::Duplicate(chunk, INVALID_INDEX, mask0, repeatCount, 1, B32_VEC_REPEAT_STRIDE);
+        repeatOffset += repeatCount;
+    }
     AscendC::PipeBarrier<PIPE_V>();
 }
 

@@ -40,6 +40,8 @@ struct RunInfo {
     uint32_t s2Start = 0;           // first pool (logical) of this tile
     uint32_t actS2Size = 0;         // valid pools in this s2 tile (per-request bound)
     uint32_t actS2SizeAlign = 0;    // 32B-aligned mm1Res row width
+    uint32_t reqPoolLen = 0;        // clamped pool length of the owning request
+    uint32_t posBase = 0;           // pos of the tile's first row == mTileInReq * M_TILE
     uint64_t tensorQueryOffset = 0; // qbar row offset (elements) == mStart * HEAD_DIM
     uint64_t indicesOutOffset = 0;  // indices row offset (elements) == mStart * outputWidth
     bool isFirstS2InnerLoop = false;

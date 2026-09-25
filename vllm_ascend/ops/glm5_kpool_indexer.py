@@ -54,6 +54,16 @@ def _pad_positions(positions: torch.Tensor) -> torch.Tensor:
     return positions
 
 
+def _gather8_lens(x: torch.Tensor) -> torch.Tensor:
+    """Mirror a [B] lens vector to stride 8: element i lands at byte offset
+    32*i, i.e. every element 32B-aligned. The AIV scalar GM read compiles to
+    a vector-granularity access and faults at unaligned offsets, so the kernel
+    reads these arrays as ``GetValue(idx * 8)`` on the mirrored layout."""
+    out = torch.zeros(x.shape[0] * 8, dtype=torch.int32, device=x.device)
+    out[0::8] = x.to(torch.int32)
+    return out.contiguous()
+
+
 def _expand_pool_ids(pool_ids: torch.Tensor, positions: torch.Tensor, index_topk: int,
                      index_kpool: int) -> torch.Tensor:
     """Pool ids -> token indices, mirroring the Triton wrapper post-processing.
@@ -65,7 +75,7 @@ def _expand_pool_ids(pool_ids: torch.Tensor, positions: torch.Tensor, index_topk
     num_tokens = pool_ids.shape[0]
     device = pool_ids.device
     pool_topk = pool_ids.shape[1]
-    lane = torch.arange(index_kpool, device=device)
+    lane = torch.arange(index_kpool, device=device, dtype=pool_ids.dtype)
     hist = pool_ids.unsqueeze(-1) * index_kpool + lane  # [T, poolTopk, kpool]
     hist = torch.where((pool_ids < 0).unsqueeze(-1), torch.full_like(hist, -1), hist)
     hist = hist.reshape(num_tokens, index_topk)
@@ -78,6 +88,22 @@ def _expand_pool_ids(pool_ids: torch.Tensor, positions: torch.Tensor, index_topk
                        tail_start.unsqueeze(1) + tail_cols.unsqueeze(0),
                        torch.full((num_tokens, index_kpool - 1), -1, dtype=torch.long, device=device))
     return torch.cat([hist, tail.to(hist.dtype)], dim=1).view(num_tokens, 1, -1)
+
+
+def _visible_pool_lengths(
+    positions: torch.Tensor,
+    cum_query_lens: torch.Tensor,
+    indexer_seq_lens: torch.Tensor,
+    index_kpool: int,
+    max_pool_seq_len: int,
+) -> torch.Tensor:
+    """Return each token's visible pool count for packed multi-request input."""
+    token_ids = torch.arange(positions.shape[0], device=positions.device, dtype=cum_query_lens.dtype)
+    request_ids = torch.searchsorted(cum_query_lens, token_ids, right=True)
+    request_ids = request_ids.clamp_max(indexer_seq_lens.shape[0] - 1).to(torch.int64)
+    request_pool_lens = indexer_seq_lens.index_select(0, request_ids).clamp_min(0).to(positions.dtype)
+    visible = torch.minimum((positions + 1) // index_kpool, request_pool_lens)
+    return visible.clamp_max(max_pool_seq_len)
 
 
 def glm5_kpool_indexer(
@@ -140,8 +166,8 @@ def glm5_kpool_indexer(
         pool_ids, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
             qbar,
             indexer_cache,
-            cum_query_lens,
-            indexer_seq_lens,
+            _gather8_lens(cum_query_lens),
+            _gather8_lens(indexer_seq_lens),
             indexer_block_table,
             positions_pad,
             index_topk,
@@ -152,10 +178,14 @@ def glm5_kpool_indexer(
         )
         pool_ids = pool_ids[:query.shape[0], 0]  # [T, poolTopk]
         # kernel ships raw ids: mask sentinel / beyond-visibility lanes here.
-        visible = torch.minimum((positions + 1) // index_kpool,
-                                indexer_seq_lens.clamp_min(0).to(torch.int64))
-        visible = torch.minimum(visible, torch.tensor(max_pool_seq_len, device=pool_ids.device))
-        pool_ids = torch.where(pool_ids < visible, pool_ids,
+        visible = _visible_pool_lengths(
+            positions,
+            cum_query_lens,
+            indexer_seq_lens,
+            index_kpool,
+            max_pool_seq_len,
+        )
+        pool_ids = torch.where(pool_ids < visible.unsqueeze(1), pool_ids,
                                torch.full_like(pool_ids, -1))
         return _expand_pool_ids(pool_ids, positions, index_topk, index_kpool)
 

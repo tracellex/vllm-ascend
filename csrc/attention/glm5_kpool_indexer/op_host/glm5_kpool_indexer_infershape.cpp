@@ -69,11 +69,11 @@ static ge::graphStatus InferShapeGlm5KpoolIndexer(gert::InferShapeContext *conte
                         *kpool),
                 return ge::GRAPH_FAILED);
 
-    // indices: [T, 1, topkTokens + kpool - 1]
+    // Raw pool ids: Python expands these to token ids and appends the tail.
     indicesShape->SetDimNum(3);
     indicesShape->SetDim(0, qbarShape->GetDim(0));
     indicesShape->SetDim(1, 1);
-    indicesShape->SetDim(2, *topkTokens + *kpool - 1);
+    indicesShape->SetDim(2, *topkTokens / *kpool);
 
     // scores_debug: [T, maxPoolSeqLen] when output_mode == 1, else empty.
     if (outputMode != nullptr && *outputMode == 1) {

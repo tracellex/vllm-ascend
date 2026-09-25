@@ -94,23 +94,28 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::InitTilingData(const Glm5Kpo
     constInfo_.usedCoreNum = t->usedCoreNum;
 }
 
+// cum_query_lens / indexer_seq_lens arrive gather-mirrored to stride 8 by the
+// python wrapper (element i at byte offset 32*i): the AIV scalar GM read
+// compiles to a vector-granularity access and faults at non-32B-aligned
+// offsets, while AIC-side scalar reads are safe at any offset. Every index is
+// therefore multiplied by 8 before GetValue.
 template <typename Q_T>
 __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqTokenStart(uint32_t reqIdx) const
 {
-    return reqIdx == 0 ? 0 : static_cast<uint32_t>(cumQueryLensGm.GetValue(reqIdx - 1));
+    return reqIdx == 0 ? 0 : static_cast<uint32_t>(cumQueryLensGm.GetValue((reqIdx - 1) * 8));
 }
 
 template <typename Q_T>
 __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqTokenLen(uint32_t reqIdx) const
 {
-    uint32_t end = static_cast<uint32_t>(cumQueryLensGm.GetValue(reqIdx));
+    uint32_t end = static_cast<uint32_t>(cumQueryLensGm.GetValue(reqIdx * 8));
     return end - ReqTokenStart(reqIdx);
 }
 
 template <typename Q_T>
 __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqPoolLen(uint32_t reqIdx) const
 {
-    int32_t seqLen = indexerSeqLensGm.GetValue(reqIdx);
+    int32_t seqLen = indexerSeqLensGm.GetValue(reqIdx * 8);
     uint32_t p = static_cast<uint32_t>(Max(seqLen, 0));
     return Min(p, constInfo_.maxPoolSeqLen);
 }
@@ -266,32 +271,27 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
     runInfo.reqIdx = reqIdx;
     runInfo.mStart = ReqTokenStart(reqIdx) + mTileInReq * M_TILE;
     runInfo.actMSize = Min(M_TILE, ReqTokenLen(reqIdx) - mTileInReq * M_TILE);
+    runInfo.reqPoolLen = ReqPoolLen(reqIdx);
+    runInfo.posBase = mTileInReq * M_TILE; // pos within the request (units never span requests)
     runInfo.tensorQueryOffset = static_cast<uint64_t>(runInfo.mStart) * HEAD_DIM;
 
     for (uint32_t s2Tile = 0; s2Tile < s2Num; s2Tile++) {
         runInfo.loop = loop;
         runInfo.s2TileIdx = s2Tile;
         runInfo.s2Start = s2Tile * S2_TILE;
-        runInfo.actS2Size = Min(S2_TILE, ReqPoolLen(reqIdx) - runInfo.s2Start);
+        runInfo.actS2Size = Min(S2_TILE, runInfo.reqPoolLen - runInfo.s2Start);
         runInfo.actS2SizeAlign = S2_TILE; // fixed width (F3-equivalent)
         runInfo.isFirstS2InnerLoop = (s2Tile == 0);
         runInfo.isLastS2InnerLoop = (s2Tile == s2Num - 1);
         runInfo.isValid = true;
 
         if ASCEND_IS_AIC {
-            AscendC::PRINTF("AIC-PREWAIT loop=%u\n", runInfo.loop);
             CrossCoreWaitFlag(syncV1C1_);
-            AscendC::PRINTF("AIC-MM1-BEGIN loop=%u\n", runInfo.loop);
             matmulService.ComputeMm1(runInfo);
-            AscendC::PRINTF("AIC-MM1-DONE loop=%u\n", runInfo.loop);
             CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_FIX>(syncC1V1_);
-            AscendC::PRINTF("AIC-SETFLAG loop=%u\n", runInfo.loop);
         } else {
-            AscendC::PRINTF("AIV-PREWAIT loop=%u\n", runInfo.loop);
             CrossCoreWaitFlag(syncC1V1_);
-            AscendC::PRINTF("AIV-POSTWAIT loop=%u\n", runInfo.loop);
             vectorService.ProcessVec(runInfo);
-            AscendC::PRINTF("AIV-VEC-DONE loop=%u\n", runInfo.loop);
             if (runInfo.isLastS2InnerLoop) {
                 vectorService.ProcessTopK(runInfo);
             }
@@ -309,13 +309,10 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Process()
     }
 
     if ASCEND_IS_AIV {
-        AscendC::PRINTF("AIV-PROC-START aiv=%u\n", GetBlockIdx());
         vectorService.AllocEventID();
-        AscendC::PRINTF("AIV-ALLOC-EV aiv=%u\n", GetBlockIdx());
         // prime the handshake: cube may compute block 0 immediately
         CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
         CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
-        AscendC::PRINTF("AIV-PRIMED aiv=%u\n", GetBlockIdx());
     } else {
         matmulService.AllocEventID();
     }

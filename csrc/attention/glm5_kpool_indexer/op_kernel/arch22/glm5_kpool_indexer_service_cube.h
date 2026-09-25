@@ -273,7 +273,6 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
     KeyNd2NzForPA(runInfo);
     SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
     WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-    AscendC::PRINTF("CUBE-KEY loop=%u\n", runInfo.loop);
 
     queryL1Mte2BufIdx_++;
     queryL1Mte1BufIdx_ = queryL1Mte2BufIdx_;
@@ -281,7 +280,6 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
     QueryNd2Nz(runInfo);
     SetFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
     WaitFlag<HardEvent::MTE2_MTE1>(MTE2_MTE1_EVENT);
-    AscendC::PRINTF("CUBE-QUERY loop=%u\n", runInfo.loop);
 
 #if GLMK_CUBE_STAGE >= 3
     // The AllocEventID pre-set of M_MTE1 never fires on this stack when the M
@@ -291,13 +289,9 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
         WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
     }
     LoadQueryToL0a(runInfo);
-    AscendC::PRINTF("CUBE-LQA loop=%u\n", runInfo.loop);
     LoadKeyToL0b(runInfo);
-    AscendC::PRINTF("CUBE-LKB loop=%u\n", runInfo.loop);
     SetFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-    AscendC::PRINTF("CUBE-SETM1 loop=%u\n", runInfo.loop);
     WaitFlag<HardEvent::MTE1_M>(MTE1_M_EVENT);
-    AscendC::PRINTF("CUBE-LOAD loop=%u\n", runInfo.loop);
 
     ComputeL0c(runInfo);
     SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + l0BufIdx_ % L0_BUF_NUM);
@@ -305,7 +299,6 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
 
 #if GLMK_CUBE_STAGE >= 4
     Fixp(runInfo);
-    AscendC::PRINTF("CUBE-FIXP loop=%u\n", runInfo.loop);
 #endif
     l0BufIdx_++;
     kl0BufIdx_++;

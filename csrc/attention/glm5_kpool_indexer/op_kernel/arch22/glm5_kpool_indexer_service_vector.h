@@ -149,26 +149,24 @@ __aicore__ inline uint32_t Glm5KpoolServiceVector<Q_T>::RowVisiblePools(int32_t 
 }
 
 // On the first S2 tile of a token tile: cache per-row positions/visibility
-// and reset the running top-k strips.
+// and reset the running top-k strips. No GM scalar reads: the AIV scalar
+// load compiles to a vector-granularity access that faults at non-32B-aligned
+// offsets (positions were the original offender; the request pool length
+// rides in RunInfo and pos is derived arithmetically — a unit never spans
+// requests, so pos == posBase + rowInTile).
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &runInfo)
 {
-    AscendC::PRINTF("AIV-LRM-GM0 mStart=%u\n", runInfo.mStart);
-    int32_t reqPoolLen = indexerSeqLensGm.GetValue(runInfo.reqIdx);
-    AscendC::PRINTF("AIV-LRM-GM1 mStart=%u len=%d\n", runInfo.mStart, reqPoolLen);
+    int32_t reqPoolLen = static_cast<int32_t>(runInfo.reqPoolLen);
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
-        uint32_t rowGlobal = runInfo.mStart + aivHalf_ * ROWS_PER_AIV + r;
-        if (rowGlobal < constInfo_.tSize) {
-            posCache_[r] = positionsGm.GetValue(rowGlobal);
-        } else {
-            posCache_[r] = -1; // padded row marker
-        }
+        uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + r;
+        posCache_[r] = (rowInTile < runInfo.actMSize)
+                           ? static_cast<int32_t>(runInfo.posBase + rowInTile)
+                           : -1; // padded row marker
         visibleCache_[r] = RowVisiblePools(posCache_[r], reqPoolLen);
     }
-    AscendC::PRINTF("AIV-LRM-GMDONE mStart=%u\n", runInfo.mStart);
     // value = -inf, index = -1 interleaved, for all owned rows
     InitSortOutBuf(globalTopkUb_, ROWS_PER_AIV * poolTopk_ * 2);
-    AscendC::PRINTF("AIV-LRM-DONE mStart=%u\n", runInfo.mStart);
 }
 
 template <typename Q_T>
@@ -233,7 +231,6 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessVec(const RunInfo &runInfo)
 {
-    AscendC::PRINTF("AIV-VEC-ENTER loop=%u mStart=%u s2=%u\n", runInfo.loop, runInfo.mStart, runInfo.s2Start);
     if (runInfo.isFirstS2InnerLoop) {
         LoadRowMeta(runInfo);
     }
@@ -275,7 +272,6 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, c
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessTopK(const RunInfo &runInfo)
 {
-    AscendC::PRINTF("AIV-TOPK-ENTER mStart=%u\n", runInfo.mStart);
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
         if (posCache_[r] < 0) {
             continue;

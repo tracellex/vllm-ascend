@@ -238,7 +238,7 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
         vectorService.InitInputTensor(
             *reinterpret_cast<GlobalTensor<int32_t> *>(&indicesOut),
             *reinterpret_cast<GlobalTensor<float> *>(&scoresDebugOut),
-            *reinterpret_cast<GlobalTensor<int64_t> *>(&positions), cumQueryLensGm, indexerSeqLensGm);
+            *reinterpret_cast<GlobalTensor<int32_t> *>(&positions), cumQueryLensGm, indexerSeqLensGm);
         vectorService.InitWorkspaceTensor(scoreGm);
     } else {
         matmulService.InitParams(constInfo_);

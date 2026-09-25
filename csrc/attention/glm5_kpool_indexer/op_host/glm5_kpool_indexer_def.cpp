@@ -55,7 +55,7 @@ public:
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
-        // [numTokens, 1, topkTokens + kpool - 1] selected token indices, -1 padded.
+        // [numTokens, 1, topkTokens / kpool] raw pool ids, -1 padded.
         this->Output("indices")
             .ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32})

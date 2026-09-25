@@ -37,7 +37,7 @@ public:
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
     __aicore__ inline void InitInputTensor(const GlobalTensor<int32_t> &indicesOutGm,
                                            const GlobalTensor<float> &scoresDebugGm,
-                                           const GlobalTensor<int64_t> &positionsGm,
+                                           const GlobalTensor<int32_t> &positionsGm,
                                            const GlobalTensor<int32_t> &cumQueryLensGm,
                                            const GlobalTensor<int32_t> &indexerSeqLensGm);
     __aicore__ inline void InitWorkspaceTensor(const GlobalTensor<SCORE_KEY_T> &scoreGm);
@@ -68,7 +68,7 @@ protected:
     GlobalTensor<SCORE_KEY_T> scoreGm;       // [aicNum * M_TILE, maxPoolAlign]
     GlobalTensor<int32_t> indicesOutGm;      // [T, 1, outputWidth]
     GlobalTensor<float> scoresDebugGm;       // [T, maxPoolSeqLen] or empty
-    GlobalTensor<int64_t> positionsGm;       // [T pad 128]
+    GlobalTensor<int32_t> positionsGm;       // [T pad 128]
     GlobalTensor<int32_t> cumQueryLensGm;    // [B]
     GlobalTensor<int32_t> indexerSeqLensGm;  // [B]
 
@@ -125,7 +125,7 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitBuffers(TPipe *pipe)
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitInputTensor(const GlobalTensor<int32_t> &indicesOutGm,
                                                                     const GlobalTensor<float> &scoresDebugGm,
-                                                                    const GlobalTensor<int64_t> &positionsGm,
+                                                                    const GlobalTensor<int32_t> &positionsGm,
                                                                     const GlobalTensor<int32_t> &cumQueryLensGm,
                                                                     const GlobalTensor<int32_t> &indexerSeqLensGm)
 {
