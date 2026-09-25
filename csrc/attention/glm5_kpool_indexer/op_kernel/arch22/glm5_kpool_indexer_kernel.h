@@ -273,7 +273,7 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
         runInfo.s2TileIdx = s2Tile;
         runInfo.s2Start = s2Tile * S2_TILE;
         runInfo.actS2Size = Min(S2_TILE, ReqPoolLen(reqIdx) - runInfo.s2Start);
-        runInfo.actS2SizeAlign = Glm5KpoolCommon::Align<uint32_t>(runInfo.actS2Size, 16); // NZ2ND fixpipe needs 16-multiple width
+        runInfo.actS2SizeAlign = S2_TILE; // fixed width (F3-equivalent)
         runInfo.isFirstS2InnerLoop = (s2Tile == 0);
         runInfo.isLastS2InnerLoop = (s2Tile == s2Num - 1);
         runInfo.isValid = true;
@@ -288,7 +288,9 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
             CrossCoreWaitFlag(syncC1V1_);
             vectorService.ProcessVec(runInfo);
             if (runInfo.isLastS2InnerLoop) {
+#if GLMK_EMIT
                 vectorService.ProcessTopK(runInfo);
+#endif
             }
             CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
         }

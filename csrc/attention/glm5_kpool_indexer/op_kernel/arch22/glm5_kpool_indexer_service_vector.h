@@ -18,6 +18,14 @@
 #ifndef GLM5_KPOOL_INDEXER_SERVICE_VECTOR_H
 #define GLM5_KPOOL_INDEXER_SERVICE_VECTOR_H
 
+// Trustworthy content gates (top of file, before ANY use):
+#define GLMK_LRM 1 
+#define GLMK_LRM_GM 1 // scalar GM reads inside LoadRowMeta
+#define GLMK_LRM_SORT 1 // InitSortOutBuf inside LoadRowMeta  // LoadRowMeta (GM scalar reads + InitSortOutBuf)
+#define GLMK_COPY 1  // per-row DataCopyPad GM->UB
+#define GLMK_VOPS 1  // mask Duplicate + ArithProgression + SortAll + MergeSort
+#define GLMK_EMIT 1  // EmitRow (Duplicate + scalar SetValue + CopyOut)
+
 #include "kernel_operator.h"
 #include "kernel_operator_list_tensor_intf.h"
 #include "kernel_tiling/kernel_tiling.h"
@@ -155,6 +163,7 @@ __aicore__ inline uint32_t Glm5KpoolServiceVector<Q_T>::RowVisiblePools(int64_t 
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &runInfo)
 {
+#if GLMK_LRM_GM
     int32_t reqPoolLen = indexerSeqLensGm.GetValue(runInfo.reqIdx);
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
         uint32_t rowGlobal = runInfo.mStart + aivHalf_ * ROWS_PER_AIV + r;
@@ -165,8 +174,16 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &r
         }
         visibleCache_[r] = RowVisiblePools(posCache_[r], reqPoolLen);
     }
+#else
+    for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
+        posCache_[r] = r; // fake in-range positions
+        visibleCache_[r] = constInfo_.maxPoolSeqLen;
+    }
+#endif
+#if GLMK_LRM_SORT
     // value = -inf, index = -1 interleaved, for all owned rows
     InitSortOutBuf(globalTopkUb_, ROWS_PER_AIV * poolTopk_ * 2);
+#endif
 }
 
 template <typename Q_T>
@@ -177,11 +194,9 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     uint64_t bufBase = (runInfo.loop % 2) * M_TILE * runInfo.actS2SizeAlign;
     uint64_t rowBase = bufBase + rowInTile * runInfo.actS2SizeAlign;
 
-#if GLMK_FOLD_STAGE >= 9 // event-sync disabled experiment
 #else
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 #endif
-#if GLMK_FOLD_STAGE >= 1
     AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
     AscendC::DataCopyExtParams inParams;
     inParams.blockCount = 1;
@@ -201,8 +216,6 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     // (validLanes is rarely a multiple of 8).
     uint32_t visible = visibleCache_[rowLocal];
     uint32_t validLanes = (runInfo.s2Start < visible) ? Min(S2_TILE, visible - runInfo.s2Start) : 0;
-#define GLMK_FOLD_STAGE 4 // 1=copy only, 2=+mask, 3=+idx+sort, 4=full(+merge)
-#if GLMK_FOLD_STAGE >= 2
     if (validLanes < S2_TILE) {
         uint64_t laneMask[2] = {0, 0};
         for (uint32_t lane = validLanes; lane < S2_TILE; lane++) {
@@ -215,7 +228,6 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     }
 #endif
 
-#if GLMK_FOLD_STAGE >= 3
     // indices: absolute pool ids; Sort needs them as float-reinterpret uint32.
     PipeBarrier<PIPE_V>();
     ArithProgression<int32_t>(scoreIdxUb_.ReinterpretCast<int32_t>(),
@@ -236,7 +248,6 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
         SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
     }
 
-#if GLMK_FOLD_STAGE >= 4
     // fold into the running top-k: MergeSort keeps the best poolTopk pairs.
     MergeSort(globalTopkUb_[rowLocal * poolTopk_ * 2], static_cast<int32_t>(poolTopk_), sortDstUb_,
               static_cast<int32_t>(S2_TILE), mrgTmpUb_);
@@ -246,16 +257,22 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
 #endif
 }
 
-#define GLMK_DEBUG_STAGE 2 // 1=handshake only, 2=+fold, 3=full
+#define GLMK_DEBUG_STAGE 3 // 1=handshake only, 2=+fold, 3=full
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessVec(const RunInfo &runInfo)
 {
+    // V-pipe liveness probe: one plain (maskless) Duplicate, nothing else.
+    {
+        LocalTensor<float> probe = globalTopkUb_;
+        AscendC::Duplicate(probe, 0.0f, 64);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+
 #if GLMK_DEBUG_STAGE < 2
     (void)runInfo;
     return;
 #endif
     if (runInfo.isFirstS2InnerLoop) {
-#if GLMK_FOLD_STAGE >= 1
         LoadRowMeta(runInfo);
 #endif
     }
@@ -263,7 +280,9 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessVec(const RunInfo &ru
         if (posCache_[r] < 0) {
             continue; // padded row: nothing to fold or emit
         }
+#if GLMK_COPY || GLMK_VOPS
         FoldBlockIntoRowTopk(r, runInfo);
+#endif
     }
 }
 

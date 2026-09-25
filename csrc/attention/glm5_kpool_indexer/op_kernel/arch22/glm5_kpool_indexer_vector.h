@@ -52,26 +52,9 @@ __aicore__ inline void CopyOut(const GlobalTensor<T> &dstGm, const LocalTensor<T
  */
 __aicore__ inline void InitSortOutBuf(const LocalTensor<float> &src, int64_t eleNum)
 {
+    (void)eleNum;
     uint64_t mask1[2] = {0x5555555555555555, 0};
-    uint64_t mask0[2] = {0xaaaaaaaaaaaaaaaa, 0};
-    int64_t repeatNum = eleNum / B32_VEC_ELM_NUM;
-    int64_t forLoop = repeatNum / VEC_REPEAT_MAX;
-    int64_t forRemain = repeatNum % VEC_REPEAT_MAX;
-    for (int i = 0; i < forLoop; i++) {
-        AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1, VEC_REPEAT_MAX, 1,
-                           B32_VEC_REPEAT_STRIDE);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), INVALID_INDEX, mask0, VEC_REPEAT_MAX, 1,
-                           B32_VEC_REPEAT_STRIDE);
-    }
-    if (forRemain > 0) {
-        uint64_t maskAll[2] = {~0ULL, ~0ULL};
-        AscendC::Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX * B32_VEC_ELM_NUM],
-                           NEG_INF, maskAll, forRemain, 1, B32_VEC_REPEAT_STRIDE);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(src.template ReinterpretCast<int32_t>()[forLoop * VEC_REPEAT_MAX * B32_VEC_ELM_NUM],
-                           INVALID_INDEX, mask0, forRemain, 1, B32_VEC_REPEAT_STRIDE);
-    }
+    AscendC::Duplicate(src.template ReinterpretCast<int32_t>(), NEG_INF, mask1, 1, 1, B32_VEC_REPEAT_STRIDE);
     AscendC::PipeBarrier<PIPE_V>();
 }
 
