@@ -23,6 +23,14 @@
 #include "kernel_tiling/kernel_tiling.h"
 #include "glm5_kpool_indexer_template_tiling_key.h"
 
+#if (__CCE_AICORE__ == 310)
+    #include "arch35/glm5_kpool_indexer_kernel.h"
+    #define GLMK_HAS_ARCH35 1
+#else
+    #include "arch22/glm5_kpool_indexer_kernel.h"
+    #define GLMK_HAS_ARCH35 0
+#endif
+
 using namespace AscendC;
 
 namespace Glm5KpoolStub {
@@ -107,18 +115,39 @@ __global__ __aicore__ void glm5_kpool_indexer(__gm__ uint8_t *qbar, __gm__ uint8
     (void)workspace;
     TPipe tPipe;
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-#if (__CCE_AICORE__ == 310) || (defined __DAV_310R6__) || (__CCE_AICORE__ == 200)
+#if GLMK_HAS_ARCH35
+    // arch35 (Ascend 950 class): full fused implementation.
     if (ORIG_DTYPE_QBAR == DT_BF16) {
-        INVOKE_GLMK_STUB_IMPL(Glm5KpoolStubKernel, bfloat16_t);
+        Glm5KpoolKernel::Glm5KpoolIndexerKernel<bfloat16_t> op;
+        GET_TILING_DATA_WITH_STRUCT(Glm5KpoolTilingData, tiling_data_in, tiling);
+        const Glm5KpoolTilingData *__restrict tiling_data = &tiling_data_in;
+        op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                scoresDebug, workspace, tiling_data, &tPipe);
+        op.Process();
     } else {
-        INVOKE_GLMK_STUB_IMPL(Glm5KpoolStubKernel, half);
+        Glm5KpoolKernel::Glm5KpoolIndexerKernel<half> op;
+        GET_TILING_DATA_WITH_STRUCT(Glm5KpoolTilingData, tiling_data_in, tiling);
+        const Glm5KpoolTilingData *__restrict tiling_data = &tiling_data_in;
+        op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                scoresDebug, workspace, tiling_data, &tPipe);
+        op.Process();
     }
 #else
-    if constexpr (DT_Q == GLMK_TPL_FP16) {
-        INVOKE_GLMK_STUB_IMPL(Glm5KpoolStubKernel, half);
+    // arch22 (910B / A3 ascend910_93 runtime path): fused implementation.
+    if (ORIG_DTYPE_QBAR == DT_BF16) {
+        Glm5KpoolKernel::Glm5KpoolIndexerKernel<bfloat16_t> op;
+        GET_TILING_DATA_WITH_STRUCT(Glm5KpoolTilingData, tiling_data_in, tiling);
+        const Glm5KpoolTilingData *__restrict tiling_data = &tiling_data_in;
+        op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                scoresDebug, workspace, tiling_data, &tPipe);
+        op.Process();
     } else {
-        INVOKE_GLMK_STUB_IMPL(Glm5KpoolStubKernel, bfloat16_t);
+        Glm5KpoolKernel::Glm5KpoolIndexerKernel<half> op;
+        GET_TILING_DATA_WITH_STRUCT(Glm5KpoolTilingData, tiling_data_in, tiling);
+        const Glm5KpoolTilingData *__restrict tiling_data = &tiling_data_in;
+        op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                scoresDebug, workspace, tiling_data, &tPipe);
+        op.Process();
     }
 #endif
-    (void)tPipe;
 }

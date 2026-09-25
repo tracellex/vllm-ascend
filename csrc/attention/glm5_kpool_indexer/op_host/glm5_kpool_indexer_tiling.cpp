@@ -70,7 +70,13 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
                 OP_LOGE(opName, "Glm5KpoolIndexer input ranks invalid (expect 2/4/1/1/2/1)."),
                 return ge::GRAPH_FAILED);
 
-    info.tSize = static_cast<uint32_t>(qbarShape.GetStorageShape().GetDim(0));
+    // tSize comes from the OUTPUT row count (the true token count): qbar and
+    // positions are zero-padded to M_TILE multiples on the python side so the
+    // cube can read full tiles; padded rows are skipped on the vector side.
+    OP_CHECK_IF(context->GetOutputShape(INDICES_INDEX) == nullptr,
+                OP_LOGE(opName, "Shape of output indices is nullptr"), return ge::GRAPH_FAILED);
+    const gert::StorageShape &indicesShape = *context->GetOutputShape(INDICES_INDEX);
+    info.tSize = static_cast<uint32_t>(indicesShape.GetStorageShape().GetDim(0));
     info.bSize = static_cast<uint32_t>(cumShape.GetStorageShape().GetDim(0));
     info.poolsPerBlock = static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(1));
     info.numCacheBlocks = static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(0));
@@ -125,15 +131,12 @@ ge::graphStatus TilingForGlm5KpoolIndexer(gert::TilingContext *context)
     uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(info.aivNum, info.aicNum, info.aivNum);
     context->SetBlockDim(blockDim);
 
-    // Workspace: lib API scratch + per-AIC score strip (uint32 sort keys),
-    // stripBytes = M_TILE(128) * align(maxPoolSeqLen, 128) * 4. At 128K
-    // context (~31.5K pools, 24 AIC) this is ~387MB — accepted for M2; the
-    // 192MB-budget LD split lands with M3 tuning.
-    constexpr uint32_t M_TILE_WS = 128;
+    // Workspace: lib API scratch + per-AIC mm1Res strip (double-buffered fp32
+    // score tiles): aicNum * 2 * M_TILE(32) * S2_TILE(128) * 4B (~1.5MB total).
+    constexpr uint32_t M_TILE_WS = 32;
     constexpr uint32_t S2_TILE_WS = 128;
-    uint32_t maxPoolAlign = (info.maxPoolSeqLen + S2_TILE_WS - 1) / S2_TILE_WS * S2_TILE_WS;
     size_t workspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
-    workspaceSize += static_cast<size_t>(info.aicNum) * M_TILE_WS * maxPoolAlign * sizeof(uint32_t);
+    workspaceSize += static_cast<size_t>(info.aicNum) * 2 * M_TILE_WS * S2_TILE_WS * sizeof(float);
     size_t *workSpaces = context->GetWorkspaceSizes(1);
     workSpaces[0] = workspaceSize;
 

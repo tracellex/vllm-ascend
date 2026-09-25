@@ -34,9 +34,24 @@ def _ascendc_available() -> bool:
 
 
 def _compute_qbar(query: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """Head-weighted query [T, heads, dim] + [T, heads] -> [T, dim] bf16."""
-    qbar = (query.float() * weights.float().unsqueeze(-1)).sum(dim=1)
-    return qbar.to(query.dtype).contiguous()
+    """Head-weighted query [T, heads, dim] + [T, heads] -> [T, dim] bf16.
+
+    Rows are zero-padded to a multiple of 32 so full cube tiles stay in
+    bounds; padded rows are skipped by the kernel on the vector side.
+    """
+    qbar = (query.float() * weights.float().unsqueeze(-1)).sum(dim=1).to(query.dtype)
+    num_tokens = qbar.shape[0]
+    pad_rows = (-num_tokens) % 32
+    if pad_rows:
+        qbar = torch.nn.functional.pad(qbar, (0, 0, 0, pad_rows))
+    return qbar.contiguous()
+
+
+def _pad_positions(positions: torch.Tensor) -> torch.Tensor:
+    pad_rows = (-positions.shape[0]) % 32
+    if pad_rows:
+        return torch.nn.functional.pad(positions, (0, pad_rows), value=0).contiguous()
+    return positions
 
 
 def glm5_kpool_indexer(
@@ -95,20 +110,21 @@ def glm5_kpool_indexer(
                 index_kpool=index_kpool, max_pool_seq_len=max_pool_seq_len,
             )
         qbar = _compute_qbar(query, weights.to(query.dtype))
+        positions_pad = _pad_positions(positions)
         indices, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
             qbar,
             indexer_cache,
             cum_query_lens,
             indexer_seq_lens,
             indexer_block_table,
-            positions,
+            positions_pad,
             index_topk,
             index_kpool,
             query.shape[2],
             max_pool_seq_len,
             0,
         )
-        return indices
+        return indices[:query.shape[0]]
 
     return glm5_next_lightning_indexer_triton(
         query, indexer_cache, weights, cum_query_lens, indexer_seq_lens,
