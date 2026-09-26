@@ -21,7 +21,6 @@ constexpr uint32_t HEAD_DIM = 128;      // index_head_dim (fixed by def check)
 constexpr uint32_t M_TILE = 32;         // token rows per cube base block; 16/AIV
                                         // rows keeps the running top-k strips in UB
 constexpr uint32_t S2_TILE = 128;       // pools per cube base block
-constexpr uint32_t GLMK_MAX_REQS = 256;   // per-core request meta cache bound (tiling enforces)
 
 // arch22 cross-core handshake (alternating lockstep, vendored v1 pattern).
 constexpr uint32_t FIA_SYNC_MODE2 = 2;

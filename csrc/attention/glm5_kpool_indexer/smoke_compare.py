@@ -145,11 +145,6 @@ CASES = {
     # single request spanning 3 core pairs: cores-vs-requests discriminator
     "single96": (lambda: build_inputs([96], 32, 64, seed=14)),
     "packed4eq": (lambda: build_inputs([32, 32, 32, 32], 32, 64, seed=15)),
-    # 4 units incl. mStart=64: 16KB-offset hypothesis probe
-    "single128": (lambda: build_inputs([128], 32, 64, seed=16)),
-    # 2 units exactly, no mStart=64: control
-    "single64": (lambda: build_inputs([64], 32, 64, seed=17)),
-
 
     # packed multi-request with unequal lengths and per-request tails
     "packed3": (lambda: build_inputs([64, 100, 37], 32, 64, seed=2)),

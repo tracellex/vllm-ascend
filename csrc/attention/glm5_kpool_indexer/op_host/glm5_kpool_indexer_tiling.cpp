@@ -87,9 +87,6 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
                         cumDim0),
                 return ge::GRAPH_FAILED);
     info.bSize = static_cast<uint32_t>(cumDim0 / 8);
-    OP_CHECK_IF(info.bSize > 256,
-                OP_LOGE(opName, "batch size %u exceeds the per-core request meta cache bound (256).", info.bSize),
-                return ge::GRAPH_FAILED);
     info.poolsPerBlock = static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(1));
     info.numCacheBlocks = static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(0));
     info.blockTableStride = static_cast<uint32_t>(blockTableShape.GetStorageShape().GetDim(1));
