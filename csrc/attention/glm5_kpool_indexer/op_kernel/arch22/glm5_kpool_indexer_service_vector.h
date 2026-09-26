@@ -204,16 +204,10 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
                            B32_VEC_REPEAT_STRIDE);
         PipeBarrier<PIPE_V>();
     }
-    // indices: absolute pool ids
-    PipeBarrier<PIPE_V>();
-    ArithProgression<int32_t>(scoreIdxUb_.ReinterpretCast<int32_t>(),
-                              static_cast<int32_t>(runInfo.s2Start), 1, S2_TILE);
-    PipeBarrier<PIPE_V>();
-
-    // descending full sort of the 128-lane block
-    SortAll(sortDstUb_, scoreUb_, scoreIdxUb_, mrgTmpUb_, S2_TILE);
-
-    // debug mode: persist raw fp32 scores through the output queue
+    // debug mode: persist raw fp32 scores through the output queue. MUST run
+    // before SortAll: Sort consumes scoreUb_ as its source and leaves it
+    // reordered, so a post-sort copy ships a descending run instead of the
+    // pool-ordered scores (M5c diagnosis was briefly misled by exactly that).
     if (constInfo_.outputMode == 1 && validLanes > 0) {
         uint32_t rowGlobal = runInfo.mStart + rowInTile;
         LocalTensor<float> dbgUb = outQue_.AllocTensor<float>();
@@ -225,6 +219,15 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
                               dbgUb, validLanes);
         outQue_.FreeTensor(dbgUb);
     }
+
+    // indices: absolute pool ids
+    PipeBarrier<PIPE_V>();
+    ArithProgression<int32_t>(scoreIdxUb_.ReinterpretCast<int32_t>(),
+                              static_cast<int32_t>(runInfo.s2Start), 1, S2_TILE);
+    PipeBarrier<PIPE_V>();
+
+    // descending full sort of the 128-lane block
+    SortAll(sortDstUb_, scoreUb_, scoreIdxUb_, mrgTmpUb_, S2_TILE);
 
     // fold into the running top-k: MergeSort keeps the best poolTopk pairs.
     MergeSort(globalTopkUb_[rowLocal * poolTopk_ * 2], static_cast<int32_t>(poolTopk_), sortDstUb_,

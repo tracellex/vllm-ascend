@@ -73,15 +73,44 @@ __aicore__ inline void InitSortOutBuf(const LocalTensor<float> &src, int64_t ele
   dst: 输出全排序的结果，排布方式为value，index 交错
   srcValue：输入的待排序浮点数
   srcIndex：浮点数的索引
-  tmp: 计算使用到的临时空间
+  tmp: 计算使用到的临时空间（至少 logitsNum*2 words，兼作层级归并输出）
   logitsNum: 排序的元素个数（32 的倍数）
  */
 __aicore__ inline void SortAll(LocalTensor<float> &dst, LocalTensor<float> &srcValue, LocalTensor<uint32_t> &srcIndex,
                                LocalTensor<float> &tmpTensor, int64_t logitsNum)
 {
+    // Step 1: intra-32 group sort. Sort only orders within each 32-element
+    // repeat: the output is mrgGroups independently sorted runs, NOT a full
+    // ordering. Skipping the hierarchical merge below fed pseudo-sorted input
+    // to MrgSort and silently corrupted every fold where the running top-k
+    // actually had to evict losers (visible_pools >= poolTopk); below
+    // visible < poolTopk the -inf padding absorbed the damage.
     int64_t sort32Repeats = logitsNum / BLOCK_BYTES;
     AscendC::Sort<float, true>(dst, srcValue, srcIndex, tmpTensor, sort32Repeats);
     AscendC::PipeBarrier<PIPE_V>();
+
+    // Step 2: one 4-way merge run -> full ordering (S2_TILE == 128 == 4 runs
+    // of 32; lightining_indexer_quant_vector.h verified MrgSort4 pattern).
+    if (sort32Repeats > 1) {
+        AscendC::MrgSort4Info params;
+        params.elementLengths[0] = BLOCK_BYTES;
+        params.elementLengths[MRG_QUE_1] = BLOCK_BYTES;
+        params.elementLengths[MRG_QUE_2] = BLOCK_BYTES;
+        params.elementLengths[MRG_QUE_3] = BLOCK_BYTES;
+        params.ifExhaustedSuspension = false;
+        params.validBit = 0b1111;
+        params.repeatTimes = 1;
+
+        AscendC::MrgSortSrcList<float> srcList;
+        srcList.src1 = dst[0];
+        srcList.src2 = dst[MRG_QUE_1 * VALUE_AND_INDEX_NUM * BLOCK_BYTES];
+        srcList.src3 = dst[MRG_QUE_2 * VALUE_AND_INDEX_NUM * BLOCK_BYTES];
+        srcList.src4 = dst[MRG_QUE_3 * VALUE_AND_INDEX_NUM * BLOCK_BYTES];
+        AscendC::MrgSort<float>(tmpTensor, srcList, params);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(dst, tmpTensor, logitsNum * VALUE_AND_INDEX_NUM);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
 }
 
 /**

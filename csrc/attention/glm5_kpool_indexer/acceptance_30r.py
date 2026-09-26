@@ -16,7 +16,8 @@ import sys
 sys.path.insert(0, "csrc/attention/glm5_kpool_indexer")
 import smoke_compare as S
 
-names = ["tiny", "single96", "packed2", "packed3", "widescreen", "big"]
+names = ["tiny", "single96", "packed2", "packed3", "widescreen", "big",
+         "contend2k", "contend4k", "contend-pack"]
 ok = True
 for r in range(1, 31):
     for n in names:

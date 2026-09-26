@@ -152,6 +152,11 @@ CASES = {
     "widescreen": (lambda: build_inputs([256], 32, 2048, seed=3)),
     # 8K pools: the shape class the operator exists for
     "big": (lambda: build_inputs([1024], 32, 8192, seed=4)),
+    # topk competition region: visible_pools reaches/exceeds poolTopk=512,
+    # where the running top-k must evict losers (M5c real-activation bug class)
+    "contend2k": (lambda: build_inputs([2048], 32, 2048, seed=16)),
+    "contend4k": (lambda: build_inputs([4096], 32, 2048, seed=17)),
+    "contend-pack": (lambda: build_inputs([2048, 1024, 512], 32, 2048, seed=18)),
 }
 
 
