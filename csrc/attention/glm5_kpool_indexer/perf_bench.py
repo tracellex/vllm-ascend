@@ -63,13 +63,18 @@ def bench(impl, inputs, tag):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--shapes", nargs="+", default=["mid", "long", "wide"])
+    p.add_argument("--only", choices=["triton", "ascendc"], default=None)
     args = p.parse_args()
+    global WARMUP, TIMED
+    if args.only:  # hang-rate-aware single-shot sampling mode
+        WARMUP, TIMED = 1, 1
     table = {n: (t, m) for n, t, m in SHAPES}
     for name in args.shapes:
         t_lens, max_pool = table[name]
         inputs = build_inputs(t_lens, 32, max_pool, seed=42)
-        bench("triton", inputs, name)
-        bench("ascendc", inputs, name)
+        impls = [args.only] if args.only else ["triton", "ascendc"]
+        for impl in impls:
+            bench(impl, inputs, name)
         del inputs
         torch.npu.empty_cache() if hasattr(torch.npu, "empty_cache") else None
     print("BENCHDONE", flush=True)
