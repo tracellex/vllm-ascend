@@ -37,9 +37,6 @@ public:
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
     __aicore__ inline void InitInputTensor(const GlobalTensor<int32_t> &indicesOutGm,
                                            const GlobalTensor<float> &scoresDebugGm,
-                                           const GlobalTensor<int32_t> &positionsGm,
-                                           const GlobalTensor<int32_t> &cumQueryLensGm,
-                                           const GlobalTensor<int32_t> &indexerSeqLensGm,
                                            const GlobalTensor<float> &mm1ResGm);
     __aicore__ inline void ProcessVec(const RunInfo &runInfo);
     __aicore__ inline void ProcessTopK(const RunInfo &runInfo);
@@ -62,9 +59,6 @@ protected:
     GlobalTensor<float> mm1ResGm;       // per-AIC [2][M_TILE][S2_TILE]
     GlobalTensor<int32_t> indicesOutGm; // [T, 1, outputWidth]
     GlobalTensor<float> scoresDebugGm;  // [T, maxPoolSeqLen] or empty
-    GlobalTensor<int32_t> positionsGm; // [T]
-    GlobalTensor<int32_t> cumQueryLensGm;
-    GlobalTensor<int32_t> indexerSeqLensGm;
 
     // running top-k: [ROWS_PER_AIV][poolTopk * 2] fp32 (value,index pairs)
     TBuf<TPosition::VECCALC> globalTopkBuf_;
@@ -116,14 +110,10 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitBuffers(TPipe *pipe)
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitInputTensor(
     const GlobalTensor<int32_t> &indicesOutGm, const GlobalTensor<float> &scoresDebugGm,
-    const GlobalTensor<int32_t> &positionsGm, const GlobalTensor<int32_t> &cumQueryLensGm,
-    const GlobalTensor<int32_t> &indexerSeqLensGm, const GlobalTensor<float> &mm1ResGm)
+    const GlobalTensor<float> &mm1ResGm)
 {
     this->indicesOutGm = indicesOutGm;
     this->scoresDebugGm = scoresDebugGm;
-    this->positionsGm = positionsGm;
-    this->cumQueryLensGm = cumQueryLensGm;
-    this->indexerSeqLensGm = indexerSeqLensGm;
     this->mm1ResGm = mm1ResGm;
 }
 

@@ -31,6 +31,9 @@ using namespace Glm5KpoolCommon;
 using AscendC::CrossCoreSetFlag;
 using AscendC::CrossCoreWaitFlag;
 
+#ifndef GLMK_HARDCODE_META
+#define GLMK_HARDCODE_META 0
+#endif
 // Deadlock bisect gate for the AIV pipeline (packed multi-request hang):
 // 3 = Vec only (skip TopK/Emit), 2 = LoadRowMeta only (skip Fold), 4 = full.
 #ifndef GLMK_STAGE_GATE
@@ -73,9 +76,18 @@ protected:
     Glm5KpoolServiceCube<Q_T> matmulService;
     Glm5KpoolServiceVector<Q_T> vectorService;
 
-    GlobalTensor<int32_t> cumQueryLensGm;
-    GlobalTensor<int32_t> indexerSeqLensGm;
+    // uint32 mirrors of lightning_indexer's seq-lens tensor type: the
+    // GlobalTensor<int32_t>::GetValue codegen faults on this stack
+    // ("scalar access internal buffer out of bounds", AIC pc pinned at the
+    // prefetch loop) while the uint32 form is production-proven there.
+    GlobalTensor<uint32_t> cumQueryLensGm;
+    GlobalTensor<uint32_t> indexerSeqLensGm;
     GlobalTensor<float> mm1ResGm;
+    // Request meta prefetched once in Init: repeated AIV-side GM scalar
+    // reads from the per-unit/per-core loops are the remaining structural
+    // difference vs the stable lightning_indexer and the prime hang suspect.
+    int32_t cumCache_[GLMK_MAX_REQS] = {0};
+    int32_t seqCache_[GLMK_MAX_REQS] = {0};
 
     ConstInfo constInfo_{};
     uint32_t aiCoreIdx_ = 0;
@@ -121,20 +133,20 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::InitTilingData(const Glm5Kpo
 template <typename Q_T>
 __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqTokenStart(uint32_t reqIdx) const
 {
-    return reqIdx == 0 ? 0 : static_cast<uint32_t>(cumQueryLensGm.GetValue((reqIdx - 1) * 8));
+    return reqIdx == 0 ? 0 : static_cast<uint32_t>(cumCache_[reqIdx - 1]);
 }
 
 template <typename Q_T>
 __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqTokenLen(uint32_t reqIdx) const
 {
-    uint32_t end = static_cast<uint32_t>(cumQueryLensGm.GetValue(reqIdx * 8));
+    uint32_t end = static_cast<uint32_t>(cumCache_[reqIdx]);
     return end - ReqTokenStart(reqIdx);
 }
 
 template <typename Q_T>
 __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqPoolLen(uint32_t reqIdx) const
 {
-    int32_t seqLen = indexerSeqLensGm.GetValue(reqIdx * 8);
+    int32_t seqLen = seqCache_[reqIdx];
     uint32_t p = static_cast<uint32_t>(Max(seqLen, 0));
     return Min(p, constInfo_.maxPoolSeqLen);
 }
@@ -272,8 +284,18 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
     }
 
     InitTilingData(tiling);
-    cumQueryLensGm.SetGlobalBuffer((__gm__ int32_t *)cumQueryLens);
-    indexerSeqLensGm.SetGlobalBuffer((__gm__ int32_t *)indexerSeqLens);
+    cumQueryLensGm.SetGlobalBuffer((__gm__ uint32_t *)cumQueryLens);
+    indexerSeqLensGm.SetGlobalBuffer((__gm__ uint32_t *)indexerSeqLens);
+#if GLMK_HARDCODE_META
+    // bisect: skip the prefetch entirely; single96 known values
+    cumCache_[0] = 96;
+    seqCache_[0] = 24;
+#else
+    for (uint32_t b = 0; b < constInfo_.bSize; b++) {
+        cumCache_[b] = static_cast<int32_t>(cumQueryLensGm.GetValue(b * 8));
+        seqCache_[b] = static_cast<int32_t>(indexerSeqLensGm.GetValue(b * 8));
+    }
+#endif
     SplitCore(aiCoreIdx_, constInfo_.usedCoreNum);
 
     pipe_ = tPipe;
@@ -297,9 +319,7 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
     if ASCEND_IS_AIV {
         vectorService.InitParams(constInfo_);
         vectorService.InitInputTensor(*reinterpret_cast<GlobalTensor<int32_t> *>(&indicesOut),
-                                      *reinterpret_cast<GlobalTensor<float> *>(&scoresDebugOut),
-                                      *reinterpret_cast<GlobalTensor<int32_t> *>(&positions), cumQueryLensGm,
-                                      indexerSeqLensGm, mm1ResGm);
+                                      *reinterpret_cast<GlobalTensor<float> *>(&scoresDebugOut), mm1ResGm);
     } else {
         matmulService.InitParams(constInfo_);
         matmulService.InitGlobalTensor(*reinterpret_cast<GlobalTensor<int32_t> *>(&indexerBlockTable),

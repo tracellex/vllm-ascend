@@ -59,8 +59,13 @@ def _gather8_lens(x: torch.Tensor) -> torch.Tensor:
     32*i, i.e. every element 32B-aligned. The AIV scalar GM read compiles to
     a vector-granularity access and faults at unaligned offsets, so the kernel
     reads these arrays as ``GetValue(idx * 8)`` on the mirrored layout."""
-    out = torch.zeros(x.shape[0] * 8, dtype=torch.int32, device=x.device)
-    out[0::8] = x.to(torch.int32)
+    # Pad to a multiple of 32 elements (128B): the AICore scalar GM read
+    # fetches a full 128B block, so a shorter tail block would read past the
+    # tensor (observed as probabilistic hangs AND faults on both AIC/AIV).
+    n = x.shape[0] * 8
+    n = ((n + 31) // 32) * 32
+    out = torch.zeros(n, dtype=torch.int32, device=x.device)
+    out[0::8][: x.shape[0]] = x.to(torch.int32)
     return out.contiguous()
 
 
