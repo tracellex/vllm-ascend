@@ -1,167 +1,92 @@
-# HANDOVER — Glm5KpoolIndexer（GLM5 lightning indexer AscendC 替换）
+# HANDOVER — Glm5KpoolIndexer 稳定性修复（挂死/fault）
 
-> 交接对象：codex（或任何接手者）。写于 2026-09-25。前置计划：
-> `/home/ascend/.claude/plans/glm5-3-flash-profiling-glm5-next-lightn-giggly-gosling.md`
-> （含完整背景/里程碑/验证口径，先读它）。
+> 交接目标：**修复概率性挂死**。精度与性能已就绪，稳定性是端到端上线前的唯一阻断项。
+> 日期：2026-09-26。前序上下文见本文末尾"已完成资产"。
 
-## 2026-09-25 晚间 Claude 复核（commit 3476b4513）——hang 根因逼近环境层
+## 1. 任务定义
 
-在 codex 静态修正基础上完成 10+ 轮可信二分（gate 全部置于文件顶部，修复此前
-宏定义晚于使用导致的假标签；codex 的 host 侧契约改动整体 stash 于
-`stash@{0}: codex-host-changes-bisect`）。新事实链：
+**问题**：`Glm5KpoolIndexer`（arch22 MIX_AIC_1_2 混合核）在正常 launch 下概率性挂死。
+**验收标准**：`smoke_compare.py` 全部 case（tiny/single96/packed2/packed3/widescreen/big）连续 30 轮零挂零 fault，且 `rows_mismatch=0` 保持。
 
-1. **AIC 段完全健康**：Nd2Nz/Mmad/Fixp（固定 S2_TILE 宽）+ AIV 早退 → 全过。
-   尾块对齐宽（8/16/32）的 Fixp 会挂，已固定为 128 全宽（越界 lane 由 AIV 行级
-   mask 消解）。
-2. **codex kernel.h 的 SetGlobalBuffer 化是独立坏因子**（同组合 reinterpret_cast
-   版过、SetGlobalBuffer 版挂）——已回退为 reinterpret_cast（vendored v1 同款）。
-3. **AIV 段：一条最普通的无 mask `Duplicate`（64 元素）即挂**。InitSortOutBuf 的
-   255-repeats 与 mask 形式均不是根因（分块/1-repeat 同挂）。
-4. **排除环境噪声**：换 davinci15、重启容器、dmesg 均无改善；
-   **torch 自带 vector op（同为 AIV V-pipe 指令）在同一容器正常**；
-   **vendored v1（官方代码 + 本 worktree 自编 OPP）同样 507035/挂**。
-5. 结论：**自编 OPP 的 AIV 段在本构建容器跨算子系统性挂**（自编 glm5 与自编 v1
-   都挂；镜像内置 OPP 的 torch op 正常）。疑点收敛到自编 OPP 与该容器 runtime 的
-   组合（编译产物 ABI / so 加载路径 / 进程上下文），而非算子代码本身。
+## 2. 环境与现场
 
-**下一步（按优先级）**：
-a. **R14（herd 单测容器入口）是正解**：用 npuctl 起标准引擎侧容器，跑自编 OPP 的
-   最小冒烟（一条 Duplicate 的 MIX kernel），判定容器上下文是否分界；
-b. 引擎侧也挂 → 携「单 Duplicate 复现 + torch vector 正常」对照提华为工单；
-c. 引擎侧过 → diff 构建容器与引擎容器（env/设备 cgroup/so 加载），逐项对齐。
+- **构建容器**：host39（=192.168.32.39，本机）`glmk-build`，镜像 `quay.io/ascend/vllm-ascend:glm53-a3-41run`，挂 `/dev/davinci0`
+- **worktree**：`/data1/ascend/myascend/code/vllm-ascend-wt/glm5-kpool-indexer`（分支 `feat/glm5-kpool-ascendc-indexer`，基线 commit `d2666a16f`）
+- **CANN 9.1.0 / driver 26.0.rc2 / ascend910_9391(A3)**
+- 跨机（192.168.32.40）跨卡复现，挂率一致 → 非单机硬件
 
-工具与现场：冒烟 `/tmp/smoke_ac_only.py`（容器 davinci15）；gate 宏在
-`arch22/glm5_kpool_indexer_service_vector.h` 顶部（GLMK_LRM/COPY/VOPS/EMIT），
-`GLMK_DEBUG_STAGE` 控早退；每轮实验先容器 root 清
-`csrc/build/binary/ascend910_93/{src,bin,gen}/*glm5*` 再编。
+**构建**（必看坑）：
+```bash
+# 容器内 root，改 kernel 后必须三处清缓存（漏一处=打出旧二进制）：
+rm -rf csrc/build/binary/ascend910_93/{src,bin}/glm5_kpool_indexer
+rm -f  csrc/build/binary/ascend910_93/gen/glm5_kpool_indexer*.done \
+       csrc/build/binary/ascend910_93/gen/Glm5KpoolIndexer-*glm5_kpool_indexer*.sh \
+       csrc/build/binary/ascend910_93/gen/Glm5KpoolIndexer_*_param.json
+# host tiling 改动还要：
+find csrc/build -name 'glm5_kpool_indexer_tiling.cpp.o' -delete
+source /usr/local/Ascend/ascend-toolkit/set_env.sh
+SOC_VERSION=ascend910_9391 bash csrc/build_aclnn.sh /opt/src/vllm-ascend ascend910_9391
+```
+kernel-only 改动**不需要**重跑 setup.py（kernel 走 OPP vendors 运行时加载）。
 
-## 2026-09-25 深夜 Claude 第二轮（commit 80fbd0e66）——AIC 已打通，AIV 定位到 int64 GM 标量读
+**跑对拍**：
+```bash
+source vllm_ascend/_cann_ops_custom/vendors/custom_transformer/bin/set_env.bash
+PYTHONPATH=/opt/src/vllm-ascend python3 csrc/attention/glm5_kpool_indexer/smoke_compare.py \
+    --cases tiny single96 packed3    # 每轮 timeout 90s；rc=124=挂, rc=1=fault, rc=0=PASS
+```
 
-**重大突破（AscendC::PRINTF 上设备追踪，ASCENDC_DEBUG 已在 op_host/CMakeLists 常开）**：
+## 3. 现象精确描述
 
-1. **AIC 挂死根因落定并修复**：arch22 上 L1→L0 装载必须用 v1 arch22 原生形式——
-   **A0 用 `LoadData3D`（LoadData3DParamsV2 + `LOAD3DV2_CONFIG` fmatrix 配置）**、
-   **B0 用旧版 `LoadData2DParams`（startIndex/repeatTimes/srcStride/dstGap）**。
-   我们此前误用 arch35 风格的 `LoadData2DParamsV2`，会把 MTE1 队列永久挂死。
-   修复后 AIC 全链（KeyNd2Nz→Mmad(unitFlag=0b11+小块PipeBarrier)→NZ2ND Fixp）
-   设备 trace 全通，锁步推进到 AIV。
-2. **aivector fault（"scalar access internal buffer OOB"）精确定位进 LoadRowMeta**：
-   trace 显示 `seqLensGm.GetValue`(int32) 过、16 次 `positionsGm.GetValue`(int64) 循环挂 →
-   **AIV 上 int64 GM 标量读是高嫌疑** → 已把 positions 全链改为 int32
-   （def/tiling/torch_adpt/kernel GlobalTensor<int32_t>；python wrapper `.to(torch.int32)`）。
-   **注意：.so 因 bgmv 缓存残留没重链成功，当前冒烟 exit=1 是旧 .so 的
-   "positions must be int64" 报错——清 `build/temp.linux-aarch64-cpython-312`
-   后重链即可验证 int32 是否解决（重链已在跑/或需 codex 重做）**。
-3. **EmitRow 已重写为纯向量版**：标量 `GetValue/SetValue`（UB）会编译成向量粒度访问、
-   非对齐偏移越界 → 改 `ExtractIndex`（GatherMask）抽 512 个 pool id 原样 CopyOut；
-   **×4 展开 + 可见性过滤 + causal tail 全部移到 python wrapper**
-   （`vllm_ascend/ops/glm5_kpool_indexer.py` 的 `_expand_pool_ids` + `torch.where(ids<visible)`）。
-   **算子输出契约变为 [T, 1, poolTopk=512] 原始 pool id**（infershape/torch_adpt/meta 同步改）。
-4. 其他已固化修复：Fixp 固定 S2_TILE 宽（尾块对齐宽挂）；InitSortOutBuf 分块 ≤127 repeats；
-   前 L0_BUF_NUM 块跳过 M_MTE1 wait（AllocEventID 预置在该栈不触发）。
+- **挂形态（B 型）**：host 卡在 `torch.npu.synchronize()`（faulthandler 证实），kernel 不完成，**无任何 runtime 报错**（device 级 sync 无超时）
+- **fault 形态（A 型）**：~100s 后 `aicore timeout` 507014/507015；或直接 `EZ9999 ... The address for the scalar to access the internal buffer of AICore is out of bounds`（core id 2 = AIC2，`mte error info: 0x2b72514bcd`、`fixp_error0: 0x2514bcd` 恒定）
+- **挂率随 lockstep 循环数连续增长**：tiny(2 units) ≈1/4、≥3 units ≈1/3、bench 连续第 5 次调用挂
+- 完成的轮次**精度全部正确**（rows_mismatch=0，性能 362us@mid / 2.13ms@long）
 
-**codex 下一步（按序）**：
-0. **.so 重链被 bgmv 卡死（本镜像可复现）**：glm-5.3-flash-a3-main 镜像下
-   `setup.py build_ext` 的 `vllm_ascend_kernels_preprocess`（bgmv_expand.cpp）报
-   "unknown file type"——M1 的可用 .so 是 **41run 镜像**容器构建的。workaround：
-   用 `quay.io/ascend/vllm-ascend:glm53-a3-41run` 起临时容器（同挂载）只跑
-   `python3 setup.py build_ext --inplace` 出 .so，再回本镜像跑冒烟；或查 bgmv 构建
-   参数差异。**OPP（算子 kernel）不受影响**——build_aclnn 在本镜像已 BUILD-OK。
-1. 跑 `/tmp/smoke_ac_only.py` 验证 int32 positions 后 AIV 是否过 LRM；
-   若仍挂：在 positions 循环内逐 r 加 PRINTF，或改 DataCopy(pos 16×i32) 进 UB 后向量算
-   visible（彻底消灭 AIV GM 标量读）。
-2. AIV 过后跑 `/tmp/smoke_m2.py` 对拍 triton（sort 后集合精确 + tail/-1 逐元素；
-   现在输出走 python 展开，直接比 [T,1,2051] 终态即可）。
-3. 语义复核（用户要求）：对照 `vllm_ascend/ops/triton/glm5_next_lightning_indexer.py`
-   逐条核对（qbar 权重域 fp32、visible=min((pos+1)//kpool, seq_pool, maxPool)、
-   -1 padding 语义、tail 位置 min(causal,2048)、`append_causal_tail` 幂等）。
-4. 性能（用户强调必须显著优于 triton）：M3 清单在 HANDOVER 下文。
+## 4. 已排除项（勿重走！每项都有 8 连测统计）
 
-**现场**：构建容器现为 **glm-5.3-flash-a3-main 镜像 @ davinci15**（用户指定用
-glm-5.3-flash 容器）；每轮实验前容器 root 清
-`csrc/build/binary/ascend910_93/{src,bin,gen}/*glm5*`；.so 用
-`rm -rf build/temp* && python3 setup.py build_ext --inplace`（bgmv 残留会假失败）。
-
-## 任务一句话
-
-用 AscendC 算子 `Glm5KpoolIndexer`（fused 打分+topk+展开+tail）替换 glm5.3-flash 的
-triton 版 `_glm5_next_lightning_indexer_score_kernel`（P 侧 prefill 占 49.6%，冷 TTFT 主犯）。
-**用户明确要求：性能必须显著优于 triton 版（triton 特别慢），同时精度对齐。**
-
-## 现场布局
-
-| 项 | 值 |
+| 排除项 | 证据 |
 |---|---|
-| 源仓 | `~/repos/vllm-ascend`（clone tracellex/vllm-ascend，branch `glm5.3-flash-0.29` = 157fc66661，与挂载树零差异） |
-| worktree | `/data1/ascend/myascend/code/vllm-ascend-wt/glm5-kpool-indexer`（branch `feat/glm5-kpool-ascendc-indexer`；git 身份已配仓内 xiangyongzh <ascend-operator@localhost>；third_party 已 rsync） |
-| 构建容器（本机 .39） | `sudo docker exec glmk-build`（镜像 quay.io/ascend/vllm-ascend:glm53-a3-41run；设备 /dev/davinci0+manager+devmm_svm+hisi_hdc 全挂；-v worktree:/opt/src/vllm-ascend -v /home/ascend/repos:/home/ascend/repos） |
-| 构建命令 | 容器内 `source /usr/local/Ascend/ascend-toolkit/set_env.sh; cd /opt/src/vllm-ascend && SOC_VERSION=ascend910_9391 bash csrc/build_aclnn.sh /opt/src/vllm-ascend ascend910_9391`（改 kernel 后必须先容器 root 清 `csrc/build/binary/ascend910_93/{src,bin,gen}/*glm5*`，否则 ninja 用旧拷贝） |
-| 冒烟脚本 | 容器 `/tmp/smoke_ac_only.py`（ascendc 单测）、`/tmp/smoke_m2.py`（对拍 triton；pos 每请求重置已修）；跑法 `ASCEND_LAUNCH_BLOCKING=1 timeout 90 python3 /tmp/smoke_ac_only.py` |
-| 主 .so | `python3 setup.py build_ext --inplace`（M1 时已构建过一次完整 .so+OPP；torch_binding 已注册 npu_glm5_kpool_indexer，meta 同步） |
+| FIA flag 信令全族 | mode2 id0 / per-pair id / mode0 / prime 记账修正，挂率不变 |
+| 确定性信令 | **GM progress counter 握手**（aaafdfe84，workspace 尾部 per-pair 计数器+SyncAll 初始化），挂率不变 |
+| kernel 工作量 | **空 kernel**（AIC 跳 MM1、AIV 跳 Fold/Emit）同挂率 37% |
+| 核比/task 布局 | MIX_AIC_1_1（+blockDim 公式+行归属改造）3/8 |
+| AIV GM 读对齐性 | gather8 布局 + 128B pad + uint32 读 + Init 预读 + 硬编码元数据（预读无辜） |
+| 硬件/单机 | 卡 0/卡 1、host39/host40 同率 |
+| ASCEND_LAUNCH_BLOCKING | 挂 2/8 |
+| triton 参考路径 | 16/16 干净（同输入同环境） |
+| **平台缺陷论** | **lightning_indexer（同构建树 vendored、同 handshake、同 MIX_AIC_1_2、AIV 上非对齐 uint32 GetValue）8/8 稳定** —— 问题是我们的 kernel 特有 |
 
-## 已完成 ✅
+msprof 注入会大幅降低小 shape 挂率（18/18）但大 shape 连续调用仍挂——时序敏感，非根治。
 
-1. **M1 全链（commit 125869d1f + 后续修复）**：def/infershape/tiling/aclnn/torch_binding(+meta)/python 分发层
-   （`vllm_ascend/ops/glm5_kpool_indexer.py`，env `VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL`=auto/triton/ascendc）+ stub kernel。
-   冒烟通过：[8,1,2051] int32。`sparse_attn_indexer_kpool.py` 已改为经分发层调用。
-2. **M2 arch22 实现（编译全过，未提交）**：`op_kernel/arch22/` 五件（common/vector/sort 辅助/service_cube/service_vector/kernel）
-   + 入口 `#if (__CCE_AICORE__==310)→arch35 else arch22`（**实测 A3 的 __CCE_AICORE__≠310，A3 走 arch22**；arch35 目录是早期按错误假设写的草案，可删或留作 950 兼容）。
-   设计：M_TILE=32（每 AIV 16 行，运行中 top-k 条带 16×512×2×4B=64KB 进 UB）；S2_TILE=128；
-   AIC 锁步（vendored v1 arch22 模式 2 握手）Mmad→NZ2ND fixpipe 到 per-AIC mm1Res GM 双缓冲（workspace 仅 ~1.5MB）；
-   AIV 行级 Sort32+MrgSort 滚动 top-512 → 标量展开 ×4 + causal tail（tail 语义对齐 append_causal_tail，幂等）。
-   tiling workspace 公式、qbar/positions 32 行 pad（python 侧 `_compute_qbar`/`_pad_positions`）、tSize 从输出 shape 读（pad 行 kernel 跳过）均已落地。
+## 5. 关键资产
 
-## 当前卡点 🔴（唯一）：AIC 全链跑通，AIV 一进 ProcessVec 行循环就 hang
+| 资产 | 位置 | 用途 |
+|---|---|---|
+| **确定性 fault 复现器** | 分支 `fault-repro`（commit `3b5d5aa88`） | 3+ units **100% fault** @AIC2，错误寄存器每轮一字不差——反汇编定位的最佳载体。**注意**：该变体把 2-unit 也弄 fault（idle 核预读也炸），仅作复现器，非候选修复 |
+| 挂死复现+证据摘要 | `csrc/attention/glm5_kpool_indexer/repro_hang.sh` | 自包含，可作华为工单附件 |
+| 对拍框架 | `smoke_compare.py`（13 cases） | triton vs ascendc 逐行集合比较 |
+| 性能基准 | `perf_bench.py`（`--only` 单调用重试模式） | M3 数据见 commit 4604048a4 |
+| 探针 | `probe_lost_task.py`（证核真挂非 task 丢失）、`triton_only_test.py`（16/16）、`lightning_hang_probe.py`（对照 8/8） | |
 
-二分矩阵（每轮 = 清缓存重编 + timeout 60-90s 冒烟；BUILD 均 OK）：
+## 6. 未验证假说与建议路线（按性价比排序）
 
-| 组合 | 结果 |
-|---|---|
-| AIC 完整（Nd2Nz+Mmad+Fixp）+ AIV ProcessVec 整体早退 | ✅ 过（shape 正确） |
-| AIC 只 Nd2Nz / +Mmad | ✅ |
-| AIC +Fixp 固定 128 宽 | ✅ |
-| AIC +Fixp 动态宽 16 对齐 | ✅（**曾以为 16 对齐修复了**，见下） |
-| AIV 进程进 ProcessVec（任何变体：仅事件、无事件、仅 copy、fold 全开、有无 LoadRowMeta） | ❌ 全部 hang |
+1. **mStart=64 的 16KB 偏移边界**（AIC0/1 的 qbar 偏移 0/8KB 不炸、AIC2 的 16KB 炸）——`QueryNd2Nz` 的 src 偏移寻址缺陷假说。**一次实验可证**：python 侧 qbar 头部 pad 32 行零（kernel mStart 整体 +32，输出行号同步 +32）；干净对照 single64（2 units 应过）vs single128（4 units 含 mStart=64 应挂）。注意 smoke 里这两个 case 在基线上不存在（回退时丢了），要重新加
+2. **反汇编定位 fault pc**：fault-repro 二进制 `.o` 用 `ccec_compiler/bin/llvm-objdump -d`（符号 `_27_mix_aic` 是 bf16 运行变体）；加载基址未确定（pc start 两轮差 0x110），可对两个 fault 版本的 .o 做 diff 求地址平移来锚定
+3. **逐段替换法**：把我们的 kernel.h 各函数逐个替换成 lightning 同款（lightning 源在 `csrc/attention/lightning_indexer/`，同目录结构可 diff），二分到具体函数
+4. **华为工单**：材料齐（repro_hang.sh + fault-repro + 恒定错误寄存器 + lightning 对照）。若走此路，端到端等修复
 
-关键数据点：
-- AIV 行循环 `for r in 16` 内**逐项拆空**（只剩 Wait/Set 事件对）仍挂；把事件也删掉（V 计算裸跑）仍挂；
-  LoadRowMeta（GM 标量读×17 + InitSortOutBuf 写 64KB）关掉也挂。
-- 即：**hang 与行循环内容无关，与 ProcessVec 的执行时长/路径本身相关**。
-- 容器重启后依旧（非设备脏）；dmesg 无 aicore fault；plog 未找到。
-- 之前"16 对齐修复"的结论存疑：那轮通过的组合是 AIV 早退版（AIC 单侧跑），并非 Fixp 动态宽+AIV 双侧。
+## 7. 已完成资产（勿重做）
 
-## 已确认的机制知识（不要重踩）
+- **精度**：全对齐（gather8 修复 AIV GM 读 fault、TPipe VECOUT 修 EmitRow 竞态、python 广播 bug）
+- **性能**：mid 362us vs triton ~1ms（2.6-3.3×）；**long 2.13ms vs 11.3ms（5.3×）**；wide 5.4ms
+- **端到端接线**（挂死解决当天即通）：模型侧 `vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py:130` 已调 dispatcher，签名零改动；`VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL=ascendc` 切换；部署需同步 `vllm_ascend/_cann_ops_custom/vendors` 到挂载树/镜像
+- 提交链：`0a5acf11d`→`330d9dae8`→`6cdd97c6f`→`aaafdfe84`→`0284ced7f`→`4604048a4`→`3b5d5aa88`(fault-repro)→`d2666a16f`(基线)
 
-1. `csrc/build_aclnn.sh` 硬编码算子清单（910b/910_93 两分支），新算子必须登记（已加 glm5_kpool_indexer）。
-2. kernel 入口必须 int 模板 + include 自己的 `*_template_tiling_key.h` + 实现宏裸名调用，否则 binary json
-   `kernelList[].tilingKey=0` → 运行时 `NnopbaseExecutorGetCoreTypeAndTaskRation failed`。当前 tilingKey=1/27 正常。
-3. 构建容器必须挂全 NPU 设备（否则 torch import stdout 污染 cmake 前缀路径 + torch_npu 初始化失败）。
-4. `csrc/build` 为容器 root 属主：清缓存必须 `docker exec` 内做，宿主 rm 静默失败。
-5. 9.1 API：tiling 的 `GetInputShape→StorageShape`；`graph/defs.h` 不存在；`Duplicate` 3 参要求 count 32B 对齐
-   （行级 mask 用 128bit 位掩码版，见 `Glm5KpoolVec` 与 service_vector 的 laneMask 用法）；`GatherMask` 的 rsvdCnt 是
-   uint64_t&；`LocalTensor` 标量写用 SetValue；`Align` 与 AscendC 同名需限定。
-6. v1 arch22 参考实现在挂载树 `code/vllm-ascend/csrc/attention/lightning_indexer/op_kernel/arch22/`（2247 行四件），
-   其 service_vector 用 **TPipe queue（VECOUT）+ PING/PONG 双事件** 组织 AIV 流程——我们的 fold 用 TBuf+手动事件简化，
-   是当前 hang 的头号嫌疑结构差异。
+## 8. 纪律提醒
 
-## 下一步建议（优先级）
-
-1. **定位 hang（建议三选一，先 a）**
-   a. **照 v1 的 queue/pingpong 结构重构 `Glm5KpoolServiceVector`**（TQue<VECOUT> + 双份 score/tmp UB 乒乓 +
-      仅 3 个事件），这是与 v1 已验证结构的最大差异，很可能绕开死锁；
-   b. 心跳法：output_mode=1 的 scores_debug 输出当心跳区，AIV 在 ProcessVec 各阶段写标记，宿主后台线程定时
-      `tensor.copy_` 抓快照定位卡点（需绕过 ASCEND_LAUNCH_BLOCKING 的同步挂）；
-   c. ccec 单算子 dump（`csrc/build.sh` + ASCEND_OP_NAME 或 msdebug）看 AIV 核是否真死等事件。
-2. **hang 解开后**：跑 `/tmp/smoke_m2.py` 对拍（sort 后集合精确 + tail/-1 逐元素）；若 Sort/Mrg 精度 tied 引起集合漂移，
-   放宽为 top-256 精确+其余近似需回报（用户强调精度对齐）。
-3. **性能（用户强调）**：当前锁步+标量展开肯定不达标。M3 清单：锁步→双缓冲流水（AIC 领先 2 块）；行批 Sort
-   （64 行一次 Sort repeat）；展开向量化（4 次 strided Adds 或 Gather）；`output_mode=1` 分数对拍 triton。
-   bench 口径：T=8192×128k 上下文，目标 ≤12ms/launch（现状 triton 33.6ms）。
-4. **留档**：memory 已有 `glmk-indexer-ascendc-dev.md` / `vllm-ascend-csrc-build-gotchas.md`，里程碑更新随手做；
-   M2 编译通过态先 commit（现在未提交，防丢）。
-
-## 纪律提醒
-
-- 主挂载树 `code/vllm-ascend` 零构建产物不动；一切改动在 worktree。
-- 完成节点双轨留档（docs/glm-5.3-flash/model-profile.md + hwnpu MCP 项目 4）。
-- AGENTS.md 规范：conventional commits + signoff；env 变量集中 envs.py。
+- 遵守仓内 AGENTS.md（14 步推理序、负结果留档）
+- 修改用前台文件工具；长操作（构建/连测）Job 化落 rc 文件轮询
+- 每轮实验记录挂率样本数（n≥8 才有区分力；1/3 vs 0 需 n≥12）
+- 容器内 `pkill -f` 会误杀 herd exec 自身（命令行匹配），用 `pgrep -f "^python3 csrc"` 行首锚定
+- 挂死后设备偶发 `507033 Failed to start device`——等 1-2 分钟自愈，勿急重启
