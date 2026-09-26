@@ -101,6 +101,10 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(info.poolsPerBlock == 0 || info.blockTableStride == 0,
                 OP_LOGE(opName, "poolsPerBlock/blockTableStride invalid."), return ge::GRAPH_FAILED);
+    // The vector-side running strip is a fixed 1024-pair full-resort window
+    // (poolTopk live + S2_TILE incoming + pad); keep the layout honest.
+    OP_CHECK_IF(info.poolTopk != 512,
+                OP_LOGE(opName, "poolTopk must be 512 (topkTokens 2048, kpool 4)."), return ge::GRAPH_FAILED);
     OP_CHECK_IF(static_cast<uint32_t>(qbarShape.GetStorageShape().GetDim(1)) != HEAD_DIM_LIMIT ||
                     cacheShape.GetStorageShape().GetDim(2) != 1 || static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(3)) != HEAD_DIM_LIMIT,
                 OP_LOGE(opName, "qbar/cache inner dims must be [*,128]/[*,*,1,128]."), return ge::GRAPH_FAILED);

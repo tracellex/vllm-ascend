@@ -155,5 +155,87 @@ __aicore__ inline void ExtractIndex(const LocalTensor<uint32_t> &idxULocal, cons
     AscendC::PipeBarrier<PIPE_V>();
 }
 
+/**
+ * dst: 1024 interleaved (value,index) pairs; first `livePairs` carry data,
+ * the rest must be -inf/-1 padding. tmp: >= 2048 words scratch, idxTmp: 1024
+ * words. Full descending sort via Sort32(32 runs) + fixed 4-way merge tree
+ * (32x32 -> 8x128 -> 2x512 -> 1x1024). Every queue granularity on this path
+ * (32/128/512 pairs) matches a stage of lightning_indexer's
+ * production-verified SortAll; the single-shot MrgSort over a partially
+ * filled strip (our eviction bug class) is never used.
+ */
+__aicore__ inline void SortFull1024(const LocalTensor<float> &dst, LocalTensor<float> &tmpTensor,
+                                    LocalTensor<uint32_t> &idxTmp)
+{
+    constexpr int64_t PAIRS = 1024;
+    constexpr int64_t WORDS = PAIRS * 2;
+    constexpr int64_t RUN = 32;
+    // 1) split interleaved -> separated value / index
+    {
+        AscendC::GatherMaskParams gp;
+        gp.repeatTimes = Ceil(WORDS * sizeof(float), VEC_REPEAT_BYTES);
+        gp.src0BlockStride = 1;
+        gp.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
+        gp.src1RepeatStride = 0;
+        uint64_t cnt = 0;
+        AscendC::GatherMask(tmpTensor, dst, 1 /* even -> value */, false, 0, gp, cnt);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::GatherMask(idxTmp, dst.ReinterpretCast<uint32_t>(), 2 /* odd -> index */, false, 0, gp, cnt);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    // 2) intra-32 group sort back into dst (interleaved)
+    LocalTensor<float> sortScratch = tmpTensor[PAIRS];
+    AscendC::Sort<float, true>(dst, tmpTensor, idxTmp, sortScratch, PAIRS / 32);
+    AscendC::PipeBarrier<PIPE_V>();
+    // 3) merge tree, alternating dst/tmp. Stage A: 32 runs of 32 -> 8 runs of 128
+    {
+        AscendC::MrgSort4Info p;
+        p.elementLengths[0] = RUN; p.elementLengths[1] = RUN;
+        p.elementLengths[2] = RUN; p.elementLengths[3] = RUN;
+        p.ifExhaustedSuspension = false;
+        p.validBit = 0b1111;
+        p.repeatTimes = 8;
+        AscendC::MrgSortSrcList<float> s;
+        s.src1 = dst[0];
+        s.src2 = dst[RUN * VALUE_AND_INDEX_NUM * 1];
+        s.src3 = dst[RUN * VALUE_AND_INDEX_NUM * 2];
+        s.src4 = dst[RUN * VALUE_AND_INDEX_NUM * 3];
+        AscendC::MrgSort<float>(tmpTensor, s, p);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    // Stage B: 8 runs of 128 -> 2 runs of 512 (repeat steps over run groups of 4)
+    {
+        AscendC::MrgSort4Info p;
+        p.elementLengths[0] = 128; p.elementLengths[1] = 128;
+        p.elementLengths[2] = 128; p.elementLengths[3] = 128;
+        p.ifExhaustedSuspension = false;
+        p.validBit = 0b1111;
+        p.repeatTimes = 2;
+        AscendC::MrgSortSrcList<float> s;
+        s.src1 = tmpTensor[0];
+        s.src2 = tmpTensor[128 * VALUE_AND_INDEX_NUM * 1];
+        s.src3 = tmpTensor[128 * VALUE_AND_INDEX_NUM * 2];
+        s.src4 = tmpTensor[128 * VALUE_AND_INDEX_NUM * 3];
+        AscendC::MrgSort<float>(dst, s, p);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+    // Stage C: 2 runs of 512 -> 1 run of 1024
+    {
+        AscendC::MrgSort4Info p;
+        p.elementLengths[0] = 512; p.elementLengths[1] = 512;
+        p.elementLengths[2] = 0; p.elementLengths[3] = 0;
+        p.ifExhaustedSuspension = false;
+        p.validBit = 0b0011;
+        p.repeatTimes = 1;
+        AscendC::MrgSortSrcList<float> s;
+        s.src1 = dst[0];
+        s.src2 = dst[512 * VALUE_AND_INDEX_NUM];
+        AscendC::MrgSort<float>(tmpTensor, s, p);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(dst, tmpTensor, WORDS);
+        AscendC::PipeBarrier<PIPE_V>();
+    }
+}
+
 } // namespace Glm5KpoolVec
 #endif // GLM5_KPOOL_INDEXER_VECTOR_H

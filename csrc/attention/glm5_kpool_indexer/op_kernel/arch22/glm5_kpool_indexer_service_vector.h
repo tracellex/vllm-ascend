@@ -75,7 +75,9 @@ protected:
     TBuf<TPosition::VECCALC> sortDstBuf_;
     LocalTensor<float> sortDstUb_; // [S2_TILE * 2]
     TBuf<TPosition::VECCALC> mrgTmpBuf_;
-    LocalTensor<float> mrgTmpUb_; // [(poolTopk + S2_TILE) * 2]
+    LocalTensor<float> mrgTmpUb_;   // SortFull1024 scratch (3072 words)
+    TBuf<TPosition::VECCALC> idxTmpBuf_;
+    LocalTensor<uint32_t> idxTmpUb_; // SortFull1024 index split (1024 words)
     // Output rides the TPipe VECOUT queue: EnQue/DeQue carry the hardware
     // V->MTE3 pipe sync (lightning_indexer pattern). Hand-rolled
     // SetFlag/WaitFlag pairs on a bare buffer race under multi-core load
@@ -87,6 +89,13 @@ protected:
     uint32_t blockId_ = 0;
     uint32_t aivHalf_ = 0;
     uint32_t poolTopk_ = 0;
+    // Running-strip entry stride in (value,index) pairs: poolTopk live pairs,
+    // then the incoming S2_TILE block, then -inf/-1 pad up to 2*poolTopk.
+    // The fold appends + pads + runs SortFull1024 (Sort32 + fixed merge
+    // tree); the single-shot MrgSort strip recursion it replaces silently
+    // dropped the last pairs of every 32-pair run whenever the strip had to
+    // evict live values (M6 eviction bug).
+    uint32_t topkStride_ = 0;
 };
 
 template <typename Q_T>
@@ -96,20 +105,23 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitParams(const ConstInfo &
     blockId_ = GetBlockIdx();
     aivHalf_ = blockId_ % 2;
     poolTopk_ = constInfo.poolTopk;
+    topkStride_ = 2 * poolTopk_; // 1024 pairs: poolTopk live + new block + pad
 }
 
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitBuffers(TPipe *pipe)
 {
-    pipe->InitBuffer(globalTopkBuf_, ROWS_PER_AIV * poolTopk_ * 2 * sizeof(float));
+    pipe->InitBuffer(globalTopkBuf_, ROWS_PER_AIV * topkStride_ * 2 * sizeof(float));
     globalTopkUb_ = globalTopkBuf_.Get<float>();
     pipe->InitBuffer(scoreBuf_, 2 * S2_TILE * sizeof(float));
     scoreUb_ = scoreBuf_.Get<float>();
     scoreIdxUb_ = scoreBuf_.Get<uint32_t>()[S2_TILE];
     pipe->InitBuffer(sortDstBuf_, S2_TILE * 2 * sizeof(float));
     sortDstUb_ = sortDstBuf_.Get<float>();
-    pipe->InitBuffer(mrgTmpBuf_, (poolTopk_ + S2_TILE) * 2 * sizeof(float));
+    pipe->InitBuffer(mrgTmpBuf_, 3072 * sizeof(float));
     mrgTmpUb_ = mrgTmpBuf_.Get<float>();
+    pipe->InitBuffer(idxTmpBuf_, 1024 * sizeof(float));
+    idxTmpUb_ = idxTmpBuf_.Get<uint32_t>();
     pipe->InitBuffer(outQue_, 1, (constInfo_.poolTopk + 64) * sizeof(int32_t));
 }
 
@@ -167,8 +179,8 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &r
                            : -1; // padded row marker
         visibleCache_[r] = RowVisiblePools(posCache_[r], reqPoolLen);
     }
-    // value = -inf, index = -1 interleaved, for all owned rows
-    InitSortOutBuf(globalTopkUb_, ROWS_PER_AIV * poolTopk_ * 2);
+    // value = -inf, index = -1 interleaved, for all owned rows (live + tail)
+    InitSortOutBuf(globalTopkUb_, ROWS_PER_AIV * topkStride_ * 2);
 }
 
 template <typename Q_T>
@@ -229,9 +241,16 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     // descending full sort of the 128-lane block
     SortAll(sortDstUb_, scoreUb_, scoreIdxUb_, mrgTmpUb_, S2_TILE);
 
-    // fold into the running top-k: MergeSort keeps the best poolTopk pairs.
-    MergeSort(globalTopkUb_[rowLocal * poolTopk_ * 2], static_cast<int32_t>(poolTopk_), sortDstUb_,
-              static_cast<int32_t>(S2_TILE), mrgTmpUb_);
+    // fold into the running top-k: append the sorted block after the live
+    // pairs, arm the -inf pad, and full-resort the whole 1024-pair strip.
+    // (Replaces the MrgSort strip recursion, which silently dropped the
+    // trailing pairs of every 32-pair run once the strip was full.)
+    LocalTensor<float> strip = globalTopkUb_[rowLocal * topkStride_ * 2];
+    AscendC::DataCopy(strip[poolTopk_ * 2], sortDstUb_, S2_TILE * 2);
+    PipeBarrier<PIPE_V>();
+    InitSortOutBuf(strip[(poolTopk_ + S2_TILE) * 2],
+                   static_cast<int64_t>((topkStride_ - poolTopk_ - S2_TILE) * 2));
+    SortFull1024(strip, mrgTmpUb_, idxTmpUb_);
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 }
 
@@ -266,7 +285,7 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, c
     // visibility).
     LocalTensor<int32_t> outUb = outQue_.AllocTensor<int32_t>();
     Glm5KpoolVec::ExtractIndex(outUb.ReinterpretCast<uint32_t>(),
-                               globalTopkUb_[rowLocal * poolTopk_ * 2].ReinterpretCast<uint32_t>(),
+                               globalTopkUb_[rowLocal * topkStride_ * 2].ReinterpretCast<uint32_t>(),
                                static_cast<int64_t>(poolTopk_));
     PipeBarrier<PIPE_V>();
     outQue_.EnQue<int32_t>(outUb);
