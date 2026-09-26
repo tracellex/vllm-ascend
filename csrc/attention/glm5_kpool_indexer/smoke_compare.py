@@ -142,6 +142,10 @@ CASES = {
     "packed3u": (lambda: build_inputs([64, 32], 32, 64, seed=7)),
     "packed4u": (lambda: build_inputs([64, 64], 32, 64, seed=8)),
     "packed3eq": (lambda: build_inputs([32, 32, 32], 32, 64, seed=9)),
+    # single request spanning 3 core pairs: cores-vs-requests discriminator
+    "single96": (lambda: build_inputs([96], 32, 64, seed=14)),
+    "packed4eq": (lambda: build_inputs([32, 32, 32, 32], 32, 64, seed=15)),
+
     # packed multi-request with unequal lengths and per-request tails
     "packed3": (lambda: build_inputs([64, 100, 37], 32, 64, seed=2)),
     # single long request, pools span many blocks through the shuffled table

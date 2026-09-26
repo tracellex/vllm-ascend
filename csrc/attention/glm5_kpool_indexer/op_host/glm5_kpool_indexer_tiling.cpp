@@ -147,6 +147,8 @@ ge::graphStatus TilingForGlm5KpoolIndexer(gert::TilingContext *context)
     constexpr uint32_t S2_TILE_WS = 128;
     size_t workspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
     workspaceSize += static_cast<size_t>(info.aicNum) * 2 * M_TILE_WS * S2_TILE_WS * sizeof(float);
+    // 64B per AIC/AIV pair for the GM progress counters (2KB for 24 pairs)
+    workspaceSize += 24 * 64;
     size_t *workSpaces = context->GetWorkspaceSizes(1);
     workSpaces[0] = workspaceSize;
 
