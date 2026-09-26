@@ -86,15 +86,17 @@ protected:
 
     int32_t posCache_[ROWS_PER_AIV] = {0};
     uint32_t visibleCache_[ROWS_PER_AIV] = {0};
+    // live pair count of each row's running strip (merge-fold state)
+    uint32_t liveCache_[ROWS_PER_AIV] = {0};
     uint32_t blockId_ = 0;
     uint32_t aivHalf_ = 0;
     uint32_t poolTopk_ = 0;
     // Running-strip entry stride in (value,index) pairs: poolTopk live pairs,
-    // then the incoming S2_TILE block, then -inf/-1 pad up to 2*poolTopk.
-    // The fold appends + pads + runs SortFull1024 (Sort32 + fixed merge
-    // tree); the single-shot MrgSort strip recursion it replaces silently
-    // dropped the last pairs of every 32-pair run whenever the strip had to
-    // evict live values (M6 eviction bug).
+    // then merge headroom up to poolTopk + S2_TILE, then -inf/-1 pad to
+    // 2*poolTopk. The fold merges the sorted incoming block into the sorted
+    // live prefix with one 2-way MrgSort (lengths kept 32-multiples) and
+    // re-pads the evicted tail; the old full SortFull1024 resort was
+    // correct but dominated the AIV cost at serving shapes.
     uint32_t topkStride_ = 0;
 };
 
@@ -181,6 +183,9 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &r
     }
     // value = -inf, index = -1 interleaved, for all owned rows (live + tail)
     InitSortOutBuf(globalTopkUb_, ROWS_PER_AIV * topkStride_ * 2);
+    for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
+        liveCache_[r] = 0;
+    }
 }
 
 template <typename Q_T>
@@ -251,16 +256,45 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     // descending full sort of the 128-lane block
     SortAll(sortDstUb_, scoreUb_, scoreIdxUb_, mrgTmpUb_, S2_TILE);
 
-    // fold into the running top-k: append the sorted block after the live
-    // pairs, arm the -inf pad, and full-resort the whole 1024-pair strip.
-    // (Replaces the MrgSort strip recursion, which silently dropped the
-    // trailing pairs of every 32-pair run once the strip was full.)
+    // Fold the sorted 128-run into the running strip with ONE 2-way merge of
+    // two already-sorted descending runs (O(live+128)) instead of a full
+    // 1024-pair resort: the strip prefix [0, liveAlign) is sorted and the
+    // block is sorted, so MrgSort4(validBit 0b0011) merges them exactly.
+    // Run lengths stay multiples of 32 (the lightning queue granularity the
+    // M6 eviction bug taught us to respect); the evicted tail is re-padded
+    // to the -inf/-1 sentinel so no stale real pair ever re-enters a merge
+    // window or the emit window.
     LocalTensor<float> strip = globalTopkUb_[rowLocal * topkStride_ * 2];
-    AscendC::DataCopy(strip[poolTopk_ * 2], sortDstUb_, S2_TILE * 2);
-    PipeBarrier<PIPE_V>();
-    InitSortOutBuf(strip[(poolTopk_ + S2_TILE) * 2],
-                   static_cast<int64_t>((topkStride_ - poolTopk_ - S2_TILE) * 2));
-    SortFull1024(strip, mrgTmpUb_, idxTmpUb_);
+    uint32_t live = liveCache_[rowLocal];
+    uint32_t liveNew = Min(poolTopk_, live + S2_TILE);
+    if (live == 0) {
+        AscendC::DataCopy(strip, sortDstUb_, S2_TILE * 2);
+        PipeBarrier<PIPE_V>();
+        InitSortOutBuf(strip[S2_TILE * 2],
+                       static_cast<int64_t>((topkStride_ - S2_TILE) * 2));
+    } else {
+        uint32_t liveAlign = (live + 31U) & ~31U;
+        AscendC::MrgSort4Info p;
+        p.elementLengths[MRG_QUE_0] = liveAlign;
+        p.elementLengths[MRG_QUE_1] = S2_TILE;
+        p.elementLengths[MRG_QUE_2] = 0;
+        p.elementLengths[MRG_QUE_3] = 0;
+        p.ifExhaustedSuspension = false;
+        p.validBit = 0b0011;
+        p.repeatTimes = 1;
+        AscendC::MrgSortSrcList<float> s;
+        s.src1 = strip[0];
+        s.src2 = sortDstUb_[0];
+        AscendC::MrgSort<float>(mrgTmpUb_, s, p);
+        AscendC::PipeBarrier<PIPE_V>();
+        AscendC::DataCopy(strip, mrgTmpUb_, (liveAlign + S2_TILE) * 2);
+        AscendC::PipeBarrier<PIPE_V>();
+        if (liveNew < poolTopk_ + S2_TILE) {
+            InitSortOutBuf(strip[liveNew * 2],
+                           static_cast<int64_t>((poolTopk_ + S2_TILE - liveNew) * 2));
+        }
+    }
+    liveCache_[rowLocal] = liveNew;
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 }
 
