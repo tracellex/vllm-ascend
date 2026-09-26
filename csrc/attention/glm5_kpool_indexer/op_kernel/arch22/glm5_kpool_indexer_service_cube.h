@@ -316,8 +316,6 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::AllocEventID()
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 0);
     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 1);
-    SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 0);
-    SetFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
 }
 
 template <typename Q_T>
@@ -328,8 +326,15 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::FreeEventID()
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 1);
     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 0);
     WaitFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 1);
-    WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 0);
-    WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + 1);
+    // The first two L0 slots do not wait on pre-armed M events. Drain only
+    // events produced by actual Mmad calls; otherwise an idle slot can wait on
+    // a PIPE_M SetFlag that never became observable on this stack.
+    if (l0BufIdx_ > 0) {
+        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + (l0BufIdx_ - 1) % L0_BUF_NUM);
+    }
+    if (l0BufIdx_ > 1) {
+        WaitFlag<HardEvent::M_MTE1>(M_MTE1_EVENT + (l0BufIdx_ - 2) % L0_BUF_NUM);
+    }
 }
 } // namespace Glm5KpoolKernel
 #endif // GLM5_KPOOL_INDEXER_SERVICE_CUBE_H
