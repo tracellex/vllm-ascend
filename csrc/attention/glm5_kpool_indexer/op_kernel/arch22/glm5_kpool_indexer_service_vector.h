@@ -76,8 +76,11 @@ protected:
     LocalTensor<float> sortDstUb_; // [S2_TILE * 2]
     TBuf<TPosition::VECCALC> mrgTmpBuf_;
     LocalTensor<float> mrgTmpUb_; // [(poolTopk + S2_TILE) * 2]
-    TBuf<TPosition::VECCALC> outBuf_;
-    LocalTensor<int32_t> outUb_; // [outputWidth + 64]
+    // Output rides the TPipe VECOUT queue: EnQue/DeQue carry the hardware
+    // V->MTE3 pipe sync (lightning_indexer pattern). Hand-rolled
+    // SetFlag/WaitFlag pairs on a bare buffer race under multi-core load
+    // (packed multi-request hangs bisected to exactly that).
+    TQue<QuePosition::VECOUT, 1> outQue_;
 
     int32_t posCache_[ROWS_PER_AIV] = {0};
     uint32_t visibleCache_[ROWS_PER_AIV] = {0};
@@ -107,8 +110,7 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitBuffers(TPipe *pipe)
     sortDstUb_ = sortDstBuf_.Get<float>();
     pipe->InitBuffer(mrgTmpBuf_, (poolTopk_ + S2_TILE) * 2 * sizeof(float));
     mrgTmpUb_ = mrgTmpBuf_.Get<float>();
-    pipe->InitBuffer(outBuf_, (constInfo_.poolTopk + 64) * sizeof(int32_t));
-    outUb_ = outBuf_.Get<int32_t>();
+    pipe->InitBuffer(outQue_, 1, (constInfo_.poolTopk + 64) * sizeof(int32_t));
 }
 
 template <typename Q_T>
@@ -128,15 +130,15 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitInputTensor(
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::AllocEventID()
 {
+    // Only the scoreUb_ ping-pong needs a pre-armed flag (first Fold waits on
+    // it). The MTE3 output direction is owned by outQue_'s EnQue/DeQue.
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
-    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
 }
 
 template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FreeEventID()
 {
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
-    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
 }
 
 template <typename Q_T>
@@ -211,16 +213,17 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     // descending full sort of the 128-lane block
     SortAll(sortDstUb_, scoreUb_, scoreIdxUb_, mrgTmpUb_, S2_TILE);
 
-    // debug mode: persist raw fp32 scores
+    // debug mode: persist raw fp32 scores through the output queue
     if (constInfo_.outputMode == 1 && validLanes > 0) {
         uint32_t rowGlobal = runInfo.mStart + rowInTile;
-        SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
-        WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT); // scoreUb written (V drained)
-        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT); // prior copy done (buffer reusable)
+        LocalTensor<float> dbgUb = outQue_.AllocTensor<float>();
+        AscendC::DataCopy(dbgUb, scoreUb_, CeilDiv(validLanes, 8) * 8);
+        outQue_.EnQue<float>(dbgUb);
+        dbgUb = outQue_.DeQue<float>();
         Glm5KpoolVec::CopyOut(scoresDebugGm[static_cast<uint64_t>(rowGlobal) * constInfo_.maxPoolSeqLen +
                                             runInfo.s2Start],
-                              scoreUb_, validLanes);
-        SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
+                              dbgUb, validLanes);
+        outQue_.FreeTensor(dbgUb);
     }
 
     // fold into the running top-k: MergeSort keeps the best poolTopk pairs.
@@ -255,22 +258,19 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, c
     uint32_t visible = visibleCache_[rowLocal];
 
     // Extract the interleaved index half of the running top-k strip and ship
-    // it raw: out-of-range / sentinel lanes are filtered in the python
-    // wrapper (it owns `positions`, hence per-row visibility).
-    Glm5KpoolVec::ExtractIndex(outUb_.ReinterpretCast<uint32_t>(),
+    // it raw through the VECOUT queue: out-of-range / sentinel lanes are
+    // filtered in the python wrapper (it owns `positions`, hence per-row
+    // visibility).
+    LocalTensor<int32_t> outUb = outQue_.AllocTensor<int32_t>();
+    Glm5KpoolVec::ExtractIndex(outUb.ReinterpretCast<uint32_t>(),
                                globalTopkUb_[rowLocal * poolTopk_ * 2].ReinterpretCast<uint32_t>(),
                                static_cast<int64_t>(poolTopk_));
     PipeBarrier<PIPE_V>();
-
-    // Cross-queue handoff outUb_ (V writes) -> MTE3 (CopyOut): the set/wait
-    // pairs carry the queue direction; wait for the prior row's copy before
-    // reusing the single outUb_.
-    SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT);
-    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT); // outUb_ written (V drained)
-    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT); // prior row's copy done
+    outQue_.EnQue<int32_t>(outUb);
+    outUb = outQue_.DeQue<int32_t>();
     Glm5KpoolVec::CopyOut(indicesOutGm[static_cast<uint64_t>(rowGlobal) * constInfo_.poolTopk],
-                          outUb_, constInfo_.poolTopk);
-    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT);
+                          outUb, constInfo_.poolTopk);
+    outQue_.FreeTensor(outUb);
 }
 
 template <typename Q_T>
