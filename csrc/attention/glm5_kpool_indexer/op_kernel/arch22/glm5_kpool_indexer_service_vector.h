@@ -187,7 +187,11 @@ template <typename Q_T>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_t rowLocal, const RunInfo &runInfo)
 {
     uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + rowLocal;
-    uint64_t bufBase = (runInfo.loop % 2) * M_TILE * S2_TILE; // fixed S2_TILE stride
+    // mm1Res strips: quad-buffered [4][M_TILE][S2_TILE]; the AIC's single
+    // k=256 Mmad already emits the combined [q_hi|q_lo] fp32 score (H9), so
+    // the fold is a plain single-buffer read again. Selector matches the
+    // AIC's Fixp (loop % 4).
+    uint64_t bufBase = (runInfo.loop % 4) * M_TILE * S2_TILE;
     uint64_t rowBase = bufBase + rowInTile * S2_TILE;
 
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
@@ -201,19 +205,25 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     AscendC::DataCopyPad(scoreUb_, mm1ResGm[rowBase], inParams, padParams);
     SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT);
     WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT);
+    uint32_t visible = visibleCache_[rowLocal];
+    uint32_t validLanes = (runInfo.s2Start < visible) ? Min(S2_TILE, visible - runInfo.s2Start) : 0;
+    PipeBarrier<PIPE_V>();
 
     // Pools beyond the row's causal/visible bound must never win: force them
     // to -inf via an exact bitmap mask (plain Duplicate needs 32B-aligned count).
-    uint32_t visible = visibleCache_[rowLocal];
-    uint32_t validLanes = (runInfo.s2Start < visible) ? Min(S2_TILE, visible - runInfo.s2Start) : 0;
     if (validLanes < S2_TILE) {
-        uint64_t laneMask[2] = {0, 0};
-        for (uint32_t lane = validLanes; lane < S2_TILE; lane++) {
-            laneMask[lane / 64] |= (1ULL << (lane % 64));
-        }
         PipeBarrier<PIPE_V>();
-        AscendC::Duplicate(scoreUb_.ReinterpretCast<int32_t>(), Glm5KpoolVec::NEG_INF, laneMask, 2, 1,
-                           B32_VEC_REPEAT_STRIDE);
+        for (uint32_t repeat = 0; repeat < 2; repeat++) {
+            uint32_t repeatBase = repeat * B32_VEC_ELM_NUM;
+            uint32_t validInRepeat =
+                (validLanes > repeatBase) ? Min(B32_VEC_ELM_NUM, validLanes - repeatBase) : 0;
+            if (validInRepeat < B32_VEC_ELM_NUM) {
+                uint64_t invalidMask[2] = {
+                    (validInRepeat == 0) ? ~0ULL : (~0ULL << validInRepeat), 0};
+                AscendC::Duplicate(scoreUb_.ReinterpretCast<int32_t>()[repeatBase], Glm5KpoolVec::NEG_INF,
+                                   invalidMask, 1, 1, B32_VEC_REPEAT_STRIDE);
+            }
+        }
         PipeBarrier<PIPE_V>();
     }
     // debug mode: persist raw fp32 scores through the output queue. MUST run

@@ -106,11 +106,45 @@ def run_impl(inputs):
     return ref.cpu(), test.cpu()
 
 
-def compare(ref, test, name, dump_rows=4):
+# A row may legally swap pools whose fp32 reference scores sit closer than
+# this: below it the ordering is under the accumulated noise of the H9
+# [q_hi | q_lo] k=256 form (own sum order + double-bf16 lo truncation;
+# measured device-vs-model error ~1e-3 at score scale ~300) and of the fp32
+# reference's own summation order (~1e-5 at the same scale). Anything above
+# is a real mismatch: the smallest defect-caused flip observed was 0.0247,
+# 12x above this bound.
+TIE_TOL = 2e-3
+
+
+def _tie_adjudicate(inputs, row, only_ref, only_test):
+    """True when every ref/test pool pair at this row is a score tie.
+    Everything runs on CPU in fp32: the adjudicator itself must be quieter
+    than the tie it judges (NPU-computed qbar pushed sub-1e-4 gaps over the
+    tolerance)."""
+    cache = inputs["indexer_cache"].float().cpu()
+    bt = inputs["indexer_block_table"][0].cpu()
+    ppb = cache.shape[1]
+    keys = cache[bt.long()].reshape(-1, cache.shape[-1])
+    q = inputs["query"][row].cpu().float()
+    w = inputs["weights"][row].cpu().float()
+    qbar = (q * w.unsqueeze(-1)).sum(dim=0)
+    pools = sorted({t // KPOOL for t in only_ref} | {t // KPOOL for t in only_test})
+    s = {p: float(qbar @ keys[p]) for p in pools}
+    ok = True
+    for a in sorted({t // KPOOL for t in only_ref}):
+        for b in sorted({t // KPOOL for t in only_test}):
+            if abs(s[a] - s[b]) > TIE_TOL:
+                ok = False
+    return ok, {p: s[p] for p in pools}
+
+
+def compare(ref, test, name, inputs=None, dump_rows=4):
     assert ref.shape == test.shape, f"{name}: shape {ref.shape} != {test.shape}"
     T = ref.shape[0]
     bad = 0
+    ties = 0
     first = []
+    first_tie = []
     for r in range(T):
         a = ref[r, 0]
         b = test[r, 0]
@@ -119,15 +153,26 @@ def compare(ref, test, name, dump_rows=4):
         na = int((a < 0).sum())
         nb = int((b < 0).sum())
         if sa != sb or na != nb:
-            bad += 1
-            if len(first) < dump_rows:
-                only_a = sorted(set(sa) - set(sb))
-                only_b = sorted(set(sb) - set(sa))
-                first.append((r, na, nb, only_a[:8], only_b[:8]))
+            only_a = sorted(set(sa) - set(sb))
+            only_b = sorted(set(sb) - set(sa))
+            is_tie = False
+            if inputs is not None and na == nb and len(only_a) == len(only_b):
+                is_tie, _ = _tie_adjudicate(inputs, r, only_a, only_b)
+            if is_tie:
+                ties += 1
+                if len(first_tie) < dump_rows:
+                    first_tie.append((r, only_a[:8], only_b[:8]))
+            else:
+                bad += 1
+                if len(first) < dump_rows:
+                    first.append((r, na, nb, only_a[:8], only_b[:8]))
     status = "PASS" if bad == 0 else "FAIL"
-    print(f"[{name}] T={T} rows_mismatch={bad} -> {status}", flush=True)
+    tie_note = f" ties(below-fp32-noise)={ties}" if ties else ""
+    print(f"[{name}] T={T} rows_mismatch={bad}{tie_note} -> {status}", flush=True)
     for r, na, nb, oa, ob in first:
         print(f"  row {r}: neg(ref/test)={na}/{nb} only_ref={oa} only_test={ob}")
+    for r, oa, ob in first_tie:
+        print(f"  row {r}: TIE only_ref={oa} only_test={ob}")
     return bad == 0
 
 
@@ -181,7 +226,7 @@ def main():
                 else [64, 100, 37],
                 args.ppb, inputs["max_pool"], seed=hash(name) % 1000)
         ref, test = run_impl(inputs)
-        ok &= compare(ref, test, name)
+        ok &= compare(ref, test, name, inputs=inputs)
     print("OVERALL:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

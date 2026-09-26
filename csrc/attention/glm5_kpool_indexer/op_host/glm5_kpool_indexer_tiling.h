@@ -41,6 +41,9 @@ constexpr uint32_t ATTR_OUTPUT_MODE_INDEX = 4;
 constexpr uint32_t DIM_IDX_ONE = 1;
 // 入参限制常量
 constexpr uint32_t HEAD_DIM_LIMIT = 128;
+// qbar rows are [q_hi | q_lo] packed (H9 FP32-split), so the input is twice
+// as wide as the cache head dim.
+constexpr uint32_t QBAR_WIDTH = 2 * HEAD_DIM_LIMIT;
 constexpr uint32_t TOPK_TOKENS_LIMIT = 8192;
 
 // -----------算子TilingData定义---------------

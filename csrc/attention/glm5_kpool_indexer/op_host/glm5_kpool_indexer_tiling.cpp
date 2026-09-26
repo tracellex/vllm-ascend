@@ -105,9 +105,10 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
     // (poolTopk live + S2_TILE incoming + pad); keep the layout honest.
     OP_CHECK_IF(info.poolTopk != 512,
                 OP_LOGE(opName, "poolTopk must be 512 (topkTokens 2048, kpool 4)."), return ge::GRAPH_FAILED);
-    OP_CHECK_IF(static_cast<uint32_t>(qbarShape.GetStorageShape().GetDim(1)) != HEAD_DIM_LIMIT ||
+    OP_CHECK_IF(static_cast<uint32_t>(qbarShape.GetStorageShape().GetDim(1)) != QBAR_WIDTH ||
                     cacheShape.GetStorageShape().GetDim(2) != 1 || static_cast<uint32_t>(cacheShape.GetStorageShape().GetDim(3)) != HEAD_DIM_LIMIT,
-                OP_LOGE(opName, "qbar/cache inner dims must be [*,128]/[*,*,1,128]."), return ge::GRAPH_FAILED);
+                OP_LOGE(opName, "qbar/cache inner dims must be [*,256 (hi|lo)]/[*,*,1,128]."),
+                return ge::GRAPH_FAILED);
 
     info.qbarType = context->GetInputDesc(QBAR_INDEX)->GetDataType();
     info.cacheType = context->GetInputDesc(INDEXER_CACHE_INDEX)->GetDataType();
@@ -145,12 +146,13 @@ ge::graphStatus TilingForGlm5KpoolIndexer(gert::TilingContext *context)
     uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(info.aivNum, info.aicNum, info.aivNum);
     context->SetBlockDim(blockDim);
 
-    // Workspace: lib API scratch + per-AIC mm1Res strip (double-buffered fp32
-    // score tiles): aicNum * 2 * M_TILE(32) * S2_TILE(128) * 4B (~1.5MB total).
+    // Workspace: lib API scratch + per-AIC mm1Res strip (quad-buffered fp32
+    // score tiles; depth 4 closes the AIC-lead-2 race at unit boundaries):
+    // aicNum * 4 * M_TILE(32) * S2_TILE(128) * 4B (~3MB total).
     constexpr uint32_t M_TILE_WS = 32;
     constexpr uint32_t S2_TILE_WS = 128;
     size_t workspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
-    workspaceSize += static_cast<size_t>(info.aicNum) * 2 * M_TILE_WS * S2_TILE_WS * sizeof(float);
+    workspaceSize += static_cast<size_t>(info.aicNum) * 4 * M_TILE_WS * S2_TILE_WS * sizeof(float);
     // 64B per AIC/AIV pair for the GM progress counters (2KB for 24 pairs)
     workspaceSize += 24 * 64;
     size_t *workSpaces = context->GetWorkspaceSizes(1);

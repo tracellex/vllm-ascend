@@ -54,10 +54,13 @@ static ge::graphStatus InferShapeGlm5KpoolIndexer(gert::InferShapeContext *conte
     const int64_t *outputMode = attrs->GetInt(ATTR_OUTPUT_MODE_INDEX);
 
     OP_CHECK_IF(qbarShape->GetDimNum() != 2,
-                OP_LOGE(context, "qbar dims (%zu) must be 2 [T, headDim]!", qbarShape->GetDimNum()),
+                OP_LOGE(context, "qbar dims (%zu) must be 2 [T, 2*headDim]!", qbarShape->GetDimNum()),
                 return ge::GRAPH_FAILED);
-    OP_CHECK_IF(qbarShape->GetDim(1) != *headDim,
-                OP_LOGE(context, "qbar headDim (%ld) != attr head_dim (%ld)!", qbarShape->GetDim(1), *headDim),
+    // qbar rows pack the FP32 head-weighted query as [q_hi | q_lo] halves
+    // (H9): the cube accumulates both Mmads in FP32 to match the Triton
+    // reference's FP32 qbar fidelity.
+    OP_CHECK_IF(qbarShape->GetDim(1) != 2 * *headDim,
+                OP_LOGE(context, "qbar width (%ld) != 2 * head_dim (%ld)!", qbarShape->GetDim(1), *headDim),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(cacheShape->GetDimNum() != 4 || cacheShape->GetDim(2) != 1 ||
                     cacheShape->GetDim(3) != *headDim,
@@ -75,8 +78,9 @@ static ge::graphStatus InferShapeGlm5KpoolIndexer(gert::InferShapeContext *conte
     indicesShape->SetDim(1, 1);
     indicesShape->SetDim(2, *topkTokens / *kpool);
 
-    // scores_debug: [T, maxPoolSeqLen] when output_mode == 1, else empty.
-    if (outputMode != nullptr && *outputMode == 1) {
+    // scores_debug: [T, maxPoolSeqLen] when output_mode >= 1 (1 = combined
+    // scores, 2 = q_lo staging diagnostic), else empty.
+    if (outputMode != nullptr && *outputMode >= 1) {
         scoresDebugShape->SetDimNum(2);
         scoresDebugShape->SetDim(0, qbarShape->GetDim(0));
         scoresDebugShape->SetDim(1, *maxPoolSeqLen);

@@ -23,7 +23,7 @@ for r in range(1, 31):
     for n in names:
         inputs = S.CASES[n]()
         ref, test = S.run_impl(inputs)
-        ok &= S.compare(ref, test, n)
+        ok &= S.compare(ref, test, n, inputs=inputs)
         if not ok:
             print("FAIL at", n, "round", r, flush=True)
             sys.exit(1)

@@ -65,7 +65,7 @@ def main():
         pools = int(d["indexer_seq_lens"].max())
         tag = f"{os.path.basename(os.path.dirname(f))}/{os.path.basename(f)} T={d['query'].shape[0]} pools={pools}"
         ref, test = S.run_impl(inputs)
-        ok &= S.compare(ref, test, tag)
+        ok &= S.compare(ref, test, tag, inputs=inputs)
         if d["query"].shape[0] > 1024:
             prefill_rows += ref.shape[0]
         else:

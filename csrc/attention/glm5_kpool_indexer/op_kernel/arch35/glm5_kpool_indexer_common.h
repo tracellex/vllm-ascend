@@ -15,6 +15,12 @@ using namespace AscendC;
 
 namespace Glm5KpoolCommon {
 
+// NOTE (H9, 2026-09-27): the op contract now feeds qbar as [T, 2*headDim]
+// packing [q_hi | q_lo] bf16 halves (see arch22 common.h / the torch
+// wrapper). arch22 consumes them with dual init-Mmads into separate L0C
+// tiles plus a vector-side fp32 add; this arch35 path still reads single
+// [T, headDim] rows and was never device-validated. Port the dual-half
+// treatment here before building any 950-class SOC.
 // ------------------常量------------------
 constexpr int32_t INVALID_IDX = -1;
 constexpr uint32_t HEAD_DIM = 128;      // index_head_dim (fixed by def check)

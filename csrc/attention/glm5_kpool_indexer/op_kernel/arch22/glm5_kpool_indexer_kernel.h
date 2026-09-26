@@ -246,8 +246,14 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
 
     pipe_ = tPipe;
 
-    // Workspace: per-AIC mm1Res double-buffered [2][M_TILE][S2_TILE] fp32.
-    uint64_t stripSize = static_cast<uint64_t>(2) * M_TILE * S2_TILE * sizeof(float);
+    // Workspace: per-AIC mm1Res quad-buffered [4][M_TILE][S2_TILE] fp32 (the
+    // single k=256 Mmad emits the combined score directly). Depth 4 (not 2):
+    // the AIC may lead its AIVs by up to two tiles (two pre-armed go-flags),
+    // and at unit boundaries the AIV lags further behind its TopK/Emit burst
+    // — with depth 2 the AIC could overwrite the very half the AIV was about
+    // to read (duplicate-tile corruption, one lost S2 tile per hit row).
+    // Lead 2 < depth 4 closes the window.
+    uint64_t stripSize = static_cast<uint64_t>(4) * M_TILE * S2_TILE * sizeof(float);
     mm1ResGm.SetGlobalBuffer((__gm__ float *)(workspace + aiCoreIdx_ * stripSize));
 
     if ASCEND_IS_AIV {
@@ -257,8 +263,10 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
                                       *reinterpret_cast<GlobalTensor<int32_t> *>(&positions), cumQueryLensGm,
                                       indexerSeqLensGm, mm1ResGm);
     } else {
+        GlobalTensor<int32_t> blockTableGm;
+        blockTableGm.SetGlobalBuffer((__gm__ int32_t *)indexerBlockTable);
         matmulService.InitParams(constInfo_);
-        matmulService.InitGlobalTensor(*reinterpret_cast<GlobalTensor<int32_t> *>(&indexerBlockTable),
+        matmulService.InitGlobalTensor(blockTableGm,
                                        *reinterpret_cast<GlobalTensor<Q_T> *>(&indexerCache),
                                        *reinterpret_cast<GlobalTensor<Q_T> *>(&qbar), mm1ResGm);
     }
@@ -282,7 +290,7 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
     runInfo.actMSize = Min(M_TILE, ReqTokenLen(reqIdx) - mTileInReq * M_TILE);
     runInfo.reqPoolLen = ReqPoolLen(reqIdx);
     runInfo.posBase = mTileInReq * M_TILE; // pos within the request (units never span requests)
-    runInfo.tensorQueryOffset = static_cast<uint64_t>(runInfo.mStart) * HEAD_DIM;
+    runInfo.tensorQueryOffset = static_cast<uint64_t>(runInfo.mStart) * QBAR_ROW_ELEMS;
 
     for (uint32_t s2Tile = 0; s2Tile < s2Num; s2Tile++) {
         runInfo.loop = loop;

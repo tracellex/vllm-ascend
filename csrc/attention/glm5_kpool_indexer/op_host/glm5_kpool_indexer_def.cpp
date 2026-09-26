@@ -18,7 +18,9 @@ class Glm5KpoolIndexer : public OpDef {
 public:
     explicit Glm5KpoolIndexer(const char *name) : OpDef(name)
     {
-        // [numTokens, headDim], head-weighted query (sum_g w_g * q_g), bf16.
+        // [numTokens, 2*headDim]: FP32 head-weighted query (sum_g w_g * q_g)
+        // split as [q_hi | q_lo] bf16 halves; the cube accumulates both
+        // products in FP32 (H9 precision fix).
         this->Input("qbar")
             .ParamType(REQUIRED)
             .DataType({ge::DT_BF16, ge::DT_FLOAT16})

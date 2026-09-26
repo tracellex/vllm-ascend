@@ -21,6 +21,10 @@ constexpr uint32_t HEAD_DIM = 128;      // index_head_dim (fixed by def check)
 constexpr uint32_t M_TILE = 32;         // token rows per cube base block; 16/AIV
                                         // rows keeps the running top-k strips in UB
 constexpr uint32_t S2_TILE = 128;       // pools per cube base block
+// qbar rows arrive FP32-split as [q_hi | q_lo] BF16 halves (H9): the cube
+// accumulates q_hi@K + q_lo@K in FP32, keeping ~16 mantissa bits of the
+// head-weighted query so top-k boundaries match the FP32 Triton reference.
+constexpr uint32_t QBAR_ROW_ELEMS = 2 * HEAD_DIM;
 
 // arch22 cross-core handshake (alternating lockstep, vendored v1 pattern).
 constexpr uint32_t FIA_SYNC_MODE2 = 2;
@@ -42,7 +46,7 @@ struct RunInfo {
     uint32_t actS2SizeAlign = 0;    // 32B-aligned mm1Res row width
     uint32_t reqPoolLen = 0;        // clamped pool length of the owning request
     uint32_t posBase = 0;           // pos of the tile's first row == mTileInReq * M_TILE
-    uint64_t tensorQueryOffset = 0; // qbar row offset (elements) == mStart * HEAD_DIM
+    uint64_t tensorQueryOffset = 0; // qbar row offset (elements) == mStart * QBAR_ROW_ELEMS
     uint64_t indicesOutOffset = 0;  // indices row offset (elements) == mStart * outputWidth
     bool isFirstS2InnerLoop = false;
     bool isLastS2InnerLoop = false;

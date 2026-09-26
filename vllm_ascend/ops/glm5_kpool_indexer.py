@@ -34,17 +34,24 @@ def _ascendc_available() -> bool:
 
 
 def _compute_qbar(query: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
-    """Head-weighted query [T, heads, dim] + [T, heads] -> [T, dim] bf16.
+    """Head-weighted query [T, heads, dim] + [T, heads] -> [T, 2*dim] bf16.
 
+    The FP32 qbar is split as [q_hi | q_lo] bf16 halves per row (H9): a
+    single bf16 rounding costs 8 mantissa bits and measurably flips top-k
+    boundaries against the FP32 Triton reference, while the two-half split
+    keeps ~16 bits via the cube's FP32-accumulated dual Mmad.
     Rows are zero-padded to a multiple of 32 so full cube tiles stay in
     bounds; padded rows are skipped by the kernel on the vector side.
     """
-    qbar = (query.float() * weights.float().unsqueeze(-1)).sum(dim=1).to(query.dtype)
-    num_tokens = qbar.shape[0]
+    qbar = (query.float() * weights.float().unsqueeze(-1)).sum(dim=1)
+    q_hi = qbar.to(query.dtype)
+    q_lo = (qbar - q_hi.float()).to(query.dtype)
+    qbar2 = torch.cat([q_hi, q_lo], dim=1)
+    num_tokens = qbar2.shape[0]
     pad_rows = (-num_tokens) % 32
     if pad_rows:
-        qbar = torch.nn.functional.pad(qbar, (0, 0, 0, pad_rows))
-    return qbar.contiguous()
+        qbar2 = torch.nn.functional.pad(qbar2, (0, 0, 0, pad_rows))
+    return qbar2.contiguous()
 
 
 def _pad_positions(positions: torch.Tensor) -> torch.Tensor:
