@@ -84,7 +84,7 @@ def build_inputs(t_lens, ppb, max_pool, seed, pool_lens=None):
     )
 
 
-def run_impl(inputs):
+def run_impl(inputs, impl="ascendc_group_topk"):
     saved = G.VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL
     try:
         G.VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL = "triton"
@@ -95,7 +95,7 @@ def run_impl(inputs):
             index_topk=INDEX_TOPK, index_kpool=KPOOL,
             max_pool_seq_len=inputs["max_pool"],
         )
-        G.VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL = "ascendc"
+        G.VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL = impl
         test = G.glm5_kpool_indexer(
             inputs["query"], inputs["indexer_cache"], inputs["weights"],
             inputs["cum_query_lens"], inputs["indexer_seq_lens"],
@@ -197,14 +197,24 @@ CASES = {
     # packed multi-request with unequal lengths and per-request tails
     "packed3": (lambda: build_inputs([64, 100, 37], 32, 64, seed=2)),
     # single long request, pools span many blocks through the shuffled table
-    "widescreen": (lambda: build_inputs([256], 32, 2048, seed=3)),
-    # 8K pools: the shape class the operator exists for
-    "big": (lambda: build_inputs([1024], 32, 8192, seed=4)),
+    "widescreen": (lambda: build_inputs([256], 32, 2048, seed=3, pool_lens=[2048])),
+    # Explicit pool lengths exercise all groups even when query T is smaller.
+    "big": (lambda: build_inputs([1024], 32, 8192, seed=4, pool_lens=[8192])),
     # topk competition region: visible_pools reaches/exceeds poolTopk=512,
     # where the running top-k must evict losers (M5c real-activation bug class)
-    "contend2k": (lambda: build_inputs([2048], 32, 2048, seed=16)),
-    "contend4k": (lambda: build_inputs([4096], 32, 2048, seed=17)),
-    "contend-pack": (lambda: build_inputs([2048, 1024, 512], 32, 2048, seed=18)),
+    "contend2k": (lambda: build_inputs([4096], 32, 2048, seed=16, pool_lens=[2048])),
+    "contend4k": (lambda: build_inputs([8192], 32, 2048, seed=17, pool_lens=[2048])),
+    "contend-pack": (lambda: build_inputs([2048, 1024, 512], 32, 2048, seed=18,
+                                           pool_lens=[2048, 1024, 512])),
+    # Exercises a 1024-pool group plus a 128-pool tail at full visibility.
+    "group-tail": (lambda: build_inputs([4608], 32, 1152, seed=19, pool_lens=[1152])),
+    # mixed batch with a zero-pool request first: the whole-batch empty fast
+    # path does not trigger, so arch22 must emit raw -1 IDs itself
+    # (ProcessEmptyUnit). The -1 count must match the Triton reference row.
+    "zeropool-head": (lambda: build_inputs([64, 64], 32, 64, seed=20, pool_lens=[0, 64])),
+    # zero-pool request between two non-empty ones: mid-batch M-tile units
+    "zeropool-mid": (lambda: build_inputs([64, 32, 64], 32, 64, seed=21,
+                                           pool_lens=[64, 0, 32])),
 }
 
 
@@ -213,6 +223,8 @@ def main():
     p.add_argument("--cases", nargs="+", default=["tiny"], choices=sorted(CASES))
     p.add_argument("--ppb", type=int, default=None,
                    help="override pools-per-block (cache.shape[1]) for all cases")
+    p.add_argument("--impl", choices=("ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"),
+                   default="ascendc_group_topk", help="AscendC implementation under test")
     args = p.parse_args()
 
     if not G._ascendc_available():
@@ -228,7 +240,7 @@ def main():
                 [int(inputs["positions"].shape[0])] if name != "packed3"
                 else [64, 100, 37],
                 args.ppb, inputs["max_pool"], seed=hash(name) % 1000)
-        ref, test = run_impl(inputs)
+        ref, test = run_impl(inputs, args.impl)
         ok &= compare(ref, test, name, inputs=inputs)
     print("OVERALL:", "PASS" if ok else "FAIL")
     sys.exit(0 if ok else 1)

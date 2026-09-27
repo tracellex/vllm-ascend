@@ -11,8 +11,8 @@
  *        token tile's whole S2 range is covered, expands pool ids to token
  *        ids (x kpool), pads with -1 and appends the causal tail.
  *
- * M_TILE is 32 so one AIV owns 16 rows; the running top-k strip for all rows
- * (16 * 512 * 2 * 4B = 64KB) fits in UB alongside sort scratch.
+ * M_TILE is 32 so one AIV owns 16 rows. Group mode stores only the 512 live
+ * value/index pairs per row; fused mode retains its 1024-pair merge headroom.
  */
 
 #ifndef GLM5_KPOOL_INDEXER_SERVICE_VECTOR_H
@@ -29,7 +29,7 @@ namespace Glm5KpoolKernel {
 using namespace Glm5KpoolCommon;
 using namespace Glm5KpoolVec;
 
-template <typename Q_T>
+template <typename Q_T, uint32_t M_TILE_SIZE>
 class Glm5KpoolServiceVector {
 public:
     __aicore__ inline Glm5KpoolServiceVector(){};
@@ -42,6 +42,8 @@ public:
                                            const GlobalTensor<int32_t> &indexerSeqLensGm,
                                            const GlobalTensor<float> &mm1ResGm);
     __aicore__ inline void ProcessVec(const RunInfo &runInfo);
+    __aicore__ inline void ProcessPoolGroup(const RunInfo &runInfo);
+    __aicore__ inline void ProcessEmptyUnit(const RunInfo &runInfo);
     __aicore__ inline void ProcessTopK(const RunInfo &runInfo);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -50,7 +52,7 @@ public:
     static constexpr uint32_t VEC1_MTE2_V_EVENT = EVENT_ID1;
     static constexpr uint32_t VEC1_V_MTE3_EVENT = EVENT_ID2;
     static constexpr uint32_t VEC1_MTE3_V_EVENT = EVENT_ID3;
-    static constexpr uint32_t ROWS_PER_AIV = M_TILE / 2; // 16
+    static constexpr uint32_t ROWS_PER_AIV = M_TILE_SIZE / 2;
 
 protected:
     __aicore__ inline uint32_t RowVisiblePools(int32_t pos, int32_t reqPoolLen) const;
@@ -60,7 +62,7 @@ protected:
     __aicore__ inline void EmitRow(uint32_t rowLocal, const RunInfo &runInfo);
 
     ConstInfo constInfo_{};
-    GlobalTensor<float> mm1ResGm;       // per-AIC [2][M_TILE][S2_TILE]
+    GlobalTensor<float> mm1ResGm;
     GlobalTensor<int32_t> indicesOutGm; // [T, 1, outputWidth]
     GlobalTensor<float> scoresDebugGm;  // [T, maxPoolSeqLen] or empty
     GlobalTensor<int32_t> positionsGm; // [T]
@@ -95,34 +97,32 @@ protected:
     uint32_t blockId_ = 0;
     uint32_t aivHalf_ = 0;
     uint32_t poolTopk_ = 0;
-    // Running-strip entry stride in (value,index) pairs: poolTopk live pairs,
-    // then merge headroom up to poolTopk + S2_TILE, then -inf/-1 pad to
-    // 2*poolTopk. The fold merges the sorted incoming block into the sorted
-    // live prefix with one 2-way MrgSort (lengths kept 32-multiples) and
-    // re-pads the evicted tail; the old full SortFull1024 resort was
-    // correct but dominated the AIV cost at serving shapes.
+    // Fused mode needs 2*poolTopk pairs for the incoming block and padding.
+    // Group mode merges two already-truncated poolTopk prefixes, so it needs
+    // no extra per-row headroom.
     uint32_t topkStride_ = 0;
 };
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitParams(const ConstInfo &constInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::InitParams(const ConstInfo &constInfo)
 {
     constInfo_ = constInfo;
     blockId_ = GetBlockIdx();
     aivHalf_ = blockId_ % 2;
     poolTopk_ = constInfo.poolTopk;
-    topkStride_ = 2 * poolTopk_; // 1024 pairs: poolTopk live + new block + pad
+    topkStride_ = IsGroupTopkMode(constInfo.outputMode) ? poolTopk_ : 2 * poolTopk_;
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitBuffers(TPipe *pipe)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::InitBuffers(TPipe *pipe)
 {
     pipe->InitBuffer(globalTopkBuf_, ROWS_PER_AIV * topkStride_ * 2 * sizeof(float));
     globalTopkUb_ = globalTopkBuf_.Get<float>();
-    pipe->InitBuffer(scoreBuf_, 2 * S2_TILE * sizeof(float));
+    const uint32_t scoreWidth = IsGroupTopkMode(constInfo_.outputMode) ? POOL_GROUP : S2_TILE;
+    pipe->InitBuffer(scoreBuf_, 2 * scoreWidth * sizeof(float));
     scoreUb_ = scoreBuf_.Get<float>();
-    scoreIdxUb_ = scoreBuf_.Get<uint32_t>()[S2_TILE];
-    pipe->InitBuffer(sortDstBuf_, S2_TILE * 2 * sizeof(float));
+    scoreIdxUb_ = scoreBuf_.Get<uint32_t>()[scoreWidth];
+    pipe->InitBuffer(sortDstBuf_, scoreWidth * 2 * sizeof(float));
     sortDstUb_ = sortDstBuf_.Get<float>();
     pipe->InitBuffer(mrgTmpBuf_, 3072 * sizeof(float));
     mrgTmpUb_ = mrgTmpBuf_.Get<float>();
@@ -131,8 +131,8 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitBuffers(TPipe *pipe)
     pipe->InitBuffer(outQue_, 1, (constInfo_.poolTopk + 64) * sizeof(int32_t));
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitInputTensor(
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::InitInputTensor(
     const GlobalTensor<int32_t> &indicesOutGm, const GlobalTensor<float> &scoresDebugGm,
     const GlobalTensor<int32_t> &positionsGm, const GlobalTensor<int32_t> &cumQueryLensGm,
     const GlobalTensor<int32_t> &indexerSeqLensGm, const GlobalTensor<float> &mm1ResGm)
@@ -145,22 +145,23 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::InitInputTensor(
     this->mm1ResGm = mm1ResGm;
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::AllocEventID()
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::AllocEventID()
 {
     // Only the scoreUb_ ping-pong needs a pre-armed flag (first Fold waits on
     // it). The MTE3 output direction is owned by outQue_'s EnQue/DeQue.
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::FreeEventID()
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::FreeEventID()
 {
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolServiceVector<Q_T>::RowVisiblePools(int32_t pos, int32_t reqPoolLen) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::RowVisiblePools(int32_t pos,
+                                                                                     int32_t reqPoolLen) const
 {
     uint32_t causalPools = static_cast<uint32_t>((static_cast<int64_t>(pos) + 1) >> 2); // kpool == 4 (asserted in tiling)
     uint32_t vis = Min(causalPools, static_cast<uint32_t>(Max(reqPoolLen, 0)));
@@ -174,8 +175,8 @@ __aicore__ inline uint32_t Glm5KpoolServiceVector<Q_T>::RowVisiblePools(int32_t 
 // offsets (positions were the original offender; the request pool length
 // rides in RunInfo and pos is derived arithmetically — a unit never spans
 // requests, so pos == posBase + rowInTile).
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::LoadRowMeta(const RunInfo &runInfo)
 {
     int32_t reqPoolLen = static_cast<int32_t>(runInfo.reqPoolLen);
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
@@ -193,12 +194,37 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &r
     }
 }
 
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::ProcessEmptyUnit(const RunInfo &runInfo)
+{
+    LoadRowMeta(runInfo);
+    for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
+        if (posCache_[r] < 0) {
+            continue;
+        }
+        const uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + r;
+        const uint32_t rowGlobal = runInfo.mStart + rowInTile;
+        // InitGlobalMemory needs a GlobalTensor lvalue and brings its own
+        // V->MTE3 event pair; reuse the proven EmitRow output lane instead
+        // (VEC duplicate -> MTE3 copy out), keeping the event ledger of a
+        // regular emit.
+        LocalTensor<int32_t> outUb = outQue_.AllocTensor<int32_t>();
+        AscendC::Duplicate<int32_t>(outUb, -1, constInfo_.poolTopk);
+        PipeBarrier<PIPE_V>();
+        outQue_.EnQue<int32_t>(outUb);
+        outUb = outQue_.DeQue<int32_t>();
+        Glm5KpoolVec::CopyOut(indicesOutGm[static_cast<uint64_t>(rowGlobal) * constInfo_.poolTopk],
+                              outUb, constInfo_.poolTopk);
+        outQue_.FreeTensor(outUb);
+    }
+}
+
 // k sorted 128-runs sit contiguously at strip[0]; merge them into one
 // sorted run (k is 2..4 — a single run needs no work). Lengths stay
 // 32-multiples per the M6 granularity lesson.
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::FlattenStripRuns(const LocalTensor<float> &strip,
-                                                                     uint32_t runCount)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::FlattenStripRuns(const LocalTensor<float> &strip,
+                                                                                  uint32_t runCount)
 {
     AscendC::MrgSort4Info p;
     p.elementLengths[MRG_QUE_0] = (runCount > 0) ? S2_TILE : 0;
@@ -219,15 +245,16 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FlattenStripRuns(const Local
     AscendC::PipeBarrier<PIPE_V>();
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_t rowLocal, const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::FoldBlockIntoRowTopk(uint32_t rowLocal,
+                                                                                      const RunInfo &runInfo)
 {
     uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + rowLocal;
     // mm1Res strips: quad-buffered [4][M_TILE][S2_TILE]; the AIC's single
     // k=256 Mmad already emits the combined [q_hi|q_lo] fp32 score (H9), so
     // the fold is a plain single-buffer read again. Selector matches the
     // AIC's Fixp (loop % 4).
-    uint64_t bufBase = (runInfo.loop % 4) * M_TILE * S2_TILE;
+    uint64_t bufBase = (runInfo.loop % 4) * M_TILE_SIZE * S2_TILE;
     uint64_t rowBase = bufBase + rowInTile * S2_TILE;
 
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
@@ -334,8 +361,8 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessVec(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::ProcessVec(const RunInfo &runInfo)
 {
     if (runInfo.isFirstS2InnerLoop) {
         LoadRowMeta(runInfo);
@@ -348,8 +375,85 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessVec(const RunInfo &ru
     }
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::ProcessPoolGroup(const RunInfo &runInfo)
+{
+    if (runInfo.isFirstS2InnerLoop) {
+        LoadRowMeta(runInfo);
+    }
+
+    for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
+        if (posCache_[r] < 0) {
+            continue;
+        }
+        const uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + r;
+        const uint64_t rowBase = static_cast<uint64_t>(rowInTile) * POOL_GROUP;
+
+        WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
+        AscendC::DataCopyPadExtParams<float> padParams{false, 0, 0, 0};
+        AscendC::DataCopyExtParams inParams;
+        inParams.blockCount = 1;
+        inParams.blockLen = POOL_GROUP * sizeof(float);
+        inParams.srcStride = 0;
+        inParams.dstStride = 0;
+        inParams.rsv = 0;
+        AscendC::DataCopyPad(scoreUb_, mm1ResGm[rowBase], inParams, padParams);
+        SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT);
+        WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT);
+
+        const uint32_t visible = visibleCache_[r];
+        const uint32_t validLanes = (runInfo.s2Start < visible) ? Min(POOL_GROUP, visible - runInfo.s2Start) : 0;
+        if (validLanes < POOL_GROUP) {
+            for (uint32_t repeat = 0; repeat < POOL_GROUP / B32_VEC_ELM_NUM; repeat++) {
+                const uint32_t repeatBase = repeat * B32_VEC_ELM_NUM;
+                const uint32_t validInRepeat =
+                    (validLanes > repeatBase) ? Min(B32_VEC_ELM_NUM, validLanes - repeatBase) : 0;
+                if (validInRepeat < B32_VEC_ELM_NUM) {
+                    uint64_t invalidMask[2] = {
+                        (validInRepeat == 0) ? ~0ULL : (~0ULL << validInRepeat), 0};
+                    AscendC::Duplicate(scoreUb_.ReinterpretCast<int32_t>()[repeatBase], Glm5KpoolVec::NEG_INF,
+                                       invalidMask, 1, 1, B32_VEC_REPEAT_STRIDE);
+                }
+            }
+            PipeBarrier<PIPE_V>();
+        }
+
+        ArithProgression<int32_t>(scoreIdxUb_.ReinterpretCast<int32_t>(),
+                                  static_cast<int32_t>(runInfo.s2Start), 1, POOL_GROUP);
+        PipeBarrier<PIPE_V>();
+        SortFull1024(sortDstUb_, mrgTmpUb_, scoreUb_, scoreIdxUb_);
+
+        LocalTensor<float> strip = globalTopkUb_[r * topkStride_ * 2];
+        if (runInfo.isFirstS2InnerLoop) {
+            DataCopy(strip, sortDstUb_, poolTopk_ * VALUE_AND_INDEX_NUM);
+        } else {
+            // Suspension is on queue exhaustion, not an output limit; emitted
+            // pairs may exceed K. Only the exact top-K prefix is retained.
+            AscendC::MrgSort4Info p;
+            p.elementLengths[MRG_QUE_0] = poolTopk_;
+            p.elementLengths[MRG_QUE_1] = poolTopk_;
+            p.elementLengths[MRG_QUE_2] = 0;
+            p.elementLengths[MRG_QUE_3] = 0;
+            p.ifExhaustedSuspension = true;
+            p.validBit = 0b0011;
+            p.repeatTimes = 1;
+            AscendC::MrgSortSrcList<float> src;
+            src.src1 = strip;
+            src.src2 = sortDstUb_;
+            AscendC::MrgSort<float>(mrgTmpUb_, src, p);
+            PipeBarrier<PIPE_V>();
+            DataCopy(strip, mrgTmpUb_, poolTopk_ * VALUE_AND_INDEX_NUM);
+        }
+        PipeBarrier<PIPE_V>();
+        liveCache_[r] = poolTopk_;
+        runCountCache_[r] = 1;
+        SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
+    }
+}
+
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::EmitRow(uint32_t rowLocal,
+                                                                         const RunInfo &runInfo)
 {
     // Vector-only pool-id emission: scalar GetValue/SetValue on UB compiles
     // to vector-granular accesses and faults at unaligned offsets, so the
@@ -381,8 +485,8 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, c
     outQue_.FreeTensor(outUb);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceVector<Q_T>::ProcessTopK(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::ProcessTopK(const RunInfo &runInfo)
 {
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
         if (posCache_[r] < 0) {

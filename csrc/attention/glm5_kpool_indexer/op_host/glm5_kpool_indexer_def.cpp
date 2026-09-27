@@ -62,7 +62,7 @@ public:
             .ParamType(REQUIRED)
             .DataTypeList({ge::DT_INT32})
             .FormatList({ge::FORMAT_ND});
-        // output_mode=1: [numTokens, maxPoolSeqLen] raw fp32 pool scores (debug).
+        // output_mode=1/2: debug score output. Production modes leave it empty.
         this->Output("scores_debug")
             .ParamType(REQUIRED)
             .DataTypeList({ge::DT_FLOAT})

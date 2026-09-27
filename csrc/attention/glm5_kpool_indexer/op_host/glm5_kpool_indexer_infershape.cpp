@@ -78,9 +78,8 @@ static ge::graphStatus InferShapeGlm5KpoolIndexer(gert::InferShapeContext *conte
     indicesShape->SetDim(1, 1);
     indicesShape->SetDim(2, *topkTokens / *kpool);
 
-    // scores_debug: [T, maxPoolSeqLen] when output_mode >= 1 (1 = combined
-    // scores, 2 = q_lo staging diagnostic), else empty.
-    if (outputMode != nullptr && *outputMode >= 1) {
+    // Scores are exposed only by explicit diagnostic modes.
+    if (outputMode != nullptr && (*outputMode == 1 || *outputMode == 2)) {
         scoresDebugShape->SetDimNum(2);
         scoresDebugShape->SetDim(0, qbarShape->GetDim(0));
         scoresDebugShape->SetDim(1, *maxPoolSeqLen);

@@ -22,7 +22,7 @@ inline std::tuple<at::Tensor, at::Tensor> construct_glm5_kpool_indexer_output_te
     int64_t poolTopk = topkTokens / kpool; // raw pool ids; expansion in python
     at::Tensor indicesOut = at::empty({qbar.size(DIM_0), 1, poolTopk}, qbar.options().dtype(at::kInt));
     at::Tensor scoresDebugOut;
-    if (outputMode >= 1) { // 1 = combined scores, 2 = q_lo staging diagnostic
+    if (outputMode == 1 || outputMode == 2) { // diagnostics only
         scoresDebugOut = at::empty({qbar.size(DIM_0), maxPoolSeqLen}, qbar.options().dtype(at::kFloat));
     } else {
         scoresDebugOut = at::empty({0}, qbar.options().dtype(at::kFloat));

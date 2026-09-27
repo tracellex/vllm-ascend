@@ -135,19 +135,35 @@ __global__ __aicore__ void glm5_kpool_indexer(__gm__ uint8_t *qbar, __gm__ uint8
 #else
     // arch22 (910B / A3 ascend910_93 runtime path): fused implementation.
     if (ORIG_DTYPE_QBAR == DT_BF16) {
-        Glm5KpoolKernel::Glm5KpoolIndexerKernel<bfloat16_t> op;
         GET_TILING_DATA_WITH_STRUCT(Glm5KpoolTilingData, tiling_data_in, tiling);
         const Glm5KpoolTilingData *__restrict tiling_data = &tiling_data_in;
-        op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
-                scoresDebug, workspace, tiling_data, &tPipe);
-        op.Process();
+        if (tiling_data->outputMode == Glm5KpoolCommon::OUTPUT_MODE_GROUP_TOPK_M64) {
+            Glm5KpoolKernel::Glm5KpoolIndexerKernel<bfloat16_t,
+                                                   Glm5KpoolCommon::M_TILE_GROUP_M64> op;
+            op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                    scoresDebug, workspace, tiling_data, &tPipe);
+            op.Process();
+        } else {
+            Glm5KpoolKernel::Glm5KpoolIndexerKernel<bfloat16_t, Glm5KpoolCommon::M_TILE> op;
+            op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                    scoresDebug, workspace, tiling_data, &tPipe);
+            op.Process();
+        }
     } else {
-        Glm5KpoolKernel::Glm5KpoolIndexerKernel<half> op;
         GET_TILING_DATA_WITH_STRUCT(Glm5KpoolTilingData, tiling_data_in, tiling);
         const Glm5KpoolTilingData *__restrict tiling_data = &tiling_data_in;
-        op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
-                scoresDebug, workspace, tiling_data, &tPipe);
-        op.Process();
+        if (tiling_data->outputMode == Glm5KpoolCommon::OUTPUT_MODE_GROUP_TOPK_M64) {
+            Glm5KpoolKernel::Glm5KpoolIndexerKernel<half,
+                                                   Glm5KpoolCommon::M_TILE_GROUP_M64> op;
+            op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                    scoresDebug, workspace, tiling_data, &tPipe);
+            op.Process();
+        } else {
+            Glm5KpoolKernel::Glm5KpoolIndexerKernel<half, Glm5KpoolCommon::M_TILE> op;
+            op.Init(qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable, positions, indices,
+                    scoresDebug, workspace, tiling_data, &tPipe);
+            op.Process();
+        }
     }
 #endif
 }

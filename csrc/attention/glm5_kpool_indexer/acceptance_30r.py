@@ -12,17 +12,22 @@ the build container:
 """
 
 import sys
+import argparse
 
 sys.path.insert(0, "csrc/attention/glm5_kpool_indexer")
 import smoke_compare as S
 
 names = ["tiny", "single96", "packed2", "packed3", "widescreen", "big",
-         "contend2k", "contend4k", "contend-pack"]
+         "contend2k", "contend4k", "contend-pack", "group-tail"]
+parser = argparse.ArgumentParser()
+parser.add_argument("--impl", choices=("ascendc_group_topk", "ascendc_group_topk_m64"),
+                    default="ascendc_group_topk")
+impl = parser.parse_args().impl
 ok = True
 for r in range(1, 31):
     for n in names:
         inputs = S.CASES[n]()
-        ref, test = S.run_impl(inputs)
+        ref, test = S.run_impl(inputs, impl=impl)
         ok &= S.compare(ref, test, n, inputs=inputs)
         if not ok:
             print("FAIL at", n, "round", r, flush=True)

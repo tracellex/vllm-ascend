@@ -156,38 +156,27 @@ __aicore__ inline void ExtractIndex(const LocalTensor<uint32_t> &idxULocal, cons
 }
 
 /**
- * dst: 1024 interleaved (value,index) pairs; first `livePairs` carry data,
- * the rest must be -inf/-1 padding. tmp: >= 2048 words scratch, idxTmp: 1024
- * words. Full descending sort via Sort32(32 runs) + fixed 4-way merge tree
- * (32x32 -> 8x128 -> 2x512 -> 1x1024). Every queue granularity on this path
- * (32/128/512 pairs) matches a stage of lightning_indexer's
+ * srcValue/srcIndex: 1024 separate score/id lanes. dst: the sorted top-512
+ * interleaved (value,index) prefix. tmp: >= 2048 words scratch. Full
+ * descending sort via Sort32(32 runs) + fixed 4-way merge tree
+ * (32x32 -> 8x128 -> 2x512 -> needed prefix of the final merge). The final
+ * merge suspends when either 512-pair input queue is exhausted; it may emit
+ * 512..1023 pairs, not a fixed top-512 count. Only its top-512 prefix is copied
+ * because group-topk discards the remainder. Every queue
+ * granularity on this path (32/128/512 pairs) matches a stage of lightning_indexer's
  * production-verified SortAll; the single-shot MrgSort over a partially
  * filled strip (our eviction bug class) is never used.
  */
 __aicore__ inline void SortFull1024(const LocalTensor<float> &dst, LocalTensor<float> &tmpTensor,
-                                    LocalTensor<uint32_t> &idxTmp)
+                                    LocalTensor<float> &srcValue, LocalTensor<uint32_t> &srcIndex)
 {
     constexpr int64_t PAIRS = 1024;
-    constexpr int64_t WORDS = PAIRS * 2;
+    constexpr int64_t TOPK_WORDS = 512 * VALUE_AND_INDEX_NUM;
     constexpr int64_t RUN = 32;
-    // 1) split interleaved -> separated value / index
-    {
-        AscendC::GatherMaskParams gp;
-        gp.repeatTimes = Ceil(WORDS * sizeof(float), VEC_REPEAT_BYTES);
-        gp.src0BlockStride = 1;
-        gp.src0RepeatStride = B32_VEC_REPEAT_STRIDE;
-        gp.src1RepeatStride = 0;
-        uint64_t cnt = 0;
-        AscendC::GatherMask(tmpTensor, dst, 1 /* even -> value */, false, 0, gp, cnt);
-        AscendC::PipeBarrier<PIPE_V>();
-        AscendC::GatherMask(idxTmp, dst.ReinterpretCast<uint32_t>(), 2 /* odd -> index */, false, 0, gp, cnt);
-        AscendC::PipeBarrier<PIPE_V>();
-    }
-    // 2) intra-32 group sort back into dst (interleaved)
-    LocalTensor<float> sortScratch = tmpTensor[PAIRS];
-    AscendC::Sort<float, true>(dst, tmpTensor, idxTmp, sortScratch, PAIRS / 32);
+    // Sort consumes separate scores/ids and produces interleaved pairs.
+    AscendC::Sort<float, true>(dst, srcValue, srcIndex, tmpTensor, PAIRS / 32);
     AscendC::PipeBarrier<PIPE_V>();
-    // 3) merge tree, alternating dst/tmp. Stage A: 32 runs of 32 -> 8 runs of 128
+    // Merge tree, alternating dst/tmp. Stage A: 32 runs of 32 -> 8 runs of 128
     {
         AscendC::MrgSort4Info p;
         p.elementLengths[0] = RUN; p.elementLengths[1] = RUN;
@@ -219,12 +208,12 @@ __aicore__ inline void SortFull1024(const LocalTensor<float> &dst, LocalTensor<f
         AscendC::MrgSort<float>(dst, s, p);
         AscendC::PipeBarrier<PIPE_V>();
     }
-    // Stage C: 2 runs of 512 -> 1 run of 1024
+    // Stage C: merge two 512-pair runs; consume only the needed top-512 prefix.
     {
         AscendC::MrgSort4Info p;
         p.elementLengths[0] = 512; p.elementLengths[1] = 512;
         p.elementLengths[2] = 0; p.elementLengths[3] = 0;
-        p.ifExhaustedSuspension = false;
+        p.ifExhaustedSuspension = true;
         p.validBit = 0b0011;
         p.repeatTimes = 1;
         AscendC::MrgSortSrcList<float> s;
@@ -232,7 +221,7 @@ __aicore__ inline void SortFull1024(const LocalTensor<float> &dst, LocalTensor<f
         s.src2 = dst[512 * VALUE_AND_INDEX_NUM];
         AscendC::MrgSort<float>(tmpTensor, s, p);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::DataCopy(dst, tmpTensor, WORDS);
+        AscendC::DataCopy(dst, tmpTensor, TOPK_WORDS);
         AscendC::PipeBarrier<PIPE_V>();
     }
 }

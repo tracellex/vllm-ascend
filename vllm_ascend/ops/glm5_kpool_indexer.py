@@ -9,9 +9,11 @@ The public signature matches the Triton wrapper exactly so the model-side
 backend can switch implementations with a one-line change.
 
 Selection is controlled by ``VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL``:
-``auto`` (default) prefers the AscendC operator when the custom op is loaded
-and the shapes are supported, falling back to Triton with a one-time warning;
-``triton`` / ``ascendc`` force one path (the latter raises if unavailable).
+``triton`` (default) keeps the validated fallback active; ``auto`` prefers the
+fused AscendC operator when available; ``ascendc`` forces the fused operator;
+``ascendc_group_topk`` selects the experimental 32-row A3 grouped path;
+``ascendc_group_topk_m64`` selects its 64-row Cube-tile candidate.
+Explicit AscendC selections raise if their required custom operator is unavailable.
 """
 
 from __future__ import annotations
@@ -21,6 +23,10 @@ import torch
 from vllm_ascend.envs import VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL
 
 from .triton.glm5_next_lightning_indexer import glm5_next_lightning_indexer_triton
+
+_GROUP_TOPK_OUTPUT_MODE = 3
+_GROUP_TOPK_M64_OUTPUT_MODE = 4
+_KERNEL_ROW_ALIGNMENT = 128
 
 _warned_fallback = False
 
@@ -40,7 +46,8 @@ def _compute_qbar(query: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     single bf16 rounding costs 8 mantissa bits and measurably flips top-k
     boundaries against the FP32 Triton reference, while the two-half split
     keeps ~16 bits via the cube's FP32-accumulated dual Mmad.
-    Rows are zero-padded to a multiple of 32 so full cube tiles stay in
+    Rows are zero-padded to a multiple of 128 so both arch22 (32/64-row)
+    and arch35 (128-row) cube tiles stay in
     bounds; padded rows are skipped by the kernel on the vector side.
     """
     qbar = (query.float() * weights.float().unsqueeze(-1)).sum(dim=1)
@@ -48,17 +55,21 @@ def _compute_qbar(query: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
     q_lo = (qbar - q_hi.float()).to(query.dtype)
     qbar2 = torch.cat([q_hi, q_lo], dim=1)
     num_tokens = qbar2.shape[0]
-    pad_rows = (-num_tokens) % 32
+    pad_rows = (-num_tokens) % _KERNEL_ROW_ALIGNMENT
     if pad_rows:
         qbar2 = torch.nn.functional.pad(qbar2, (0, 0, 0, pad_rows))
     return qbar2.contiguous()
 
 
 def _pad_positions(positions: torch.Tensor) -> torch.Tensor:
-    pad_rows = (-positions.shape[0]) % 32
+    pad_rows = (-positions.shape[0]) % _KERNEL_ROW_ALIGNMENT
     if pad_rows:
         return torch.nn.functional.pad(positions, (0, pad_rows), value=0).contiguous()
     return positions
+
+
+def _supports_ascendc_config(index_topk: int, index_kpool: int) -> bool:
+    return index_topk == 2048 and index_kpool == 4
 
 
 def _gather8_lens(x: torch.Tensor) -> torch.Tensor:
@@ -135,7 +146,7 @@ def glm5_kpool_indexer(
     corner_shape = query.shape[0] == 0 or max_pool_seq_len == 0
     if corner_shape:
         use_ascendc = False
-    elif impl in ("auto", "ascendc"):
+    elif impl in ("auto", "ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"):
         use_ascendc = True
     else:
         if impl != "triton":
@@ -143,15 +154,25 @@ def glm5_kpool_indexer(
 
             logging.getLogger(__name__).warning(
                 "Unknown VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL=%r; expected "
-                "auto/triton/ascendc. Using the Triton path.", impl,
+                "auto/triton/ascendc/ascendc_group_topk/ascendc_group_topk_m64. "
+                "Using the Triton path.", impl,
             )
         use_ascendc = False
 
+    if use_ascendc and not _supports_ascendc_config(index_topk, index_kpool):
+        if impl == "auto":
+            use_ascendc = False
+        else:
+            raise ValueError(
+                "The AscendC GLM5 KPool indexer requires index_topk=2048 "
+                "and index_kpool=4."
+            )
+
     if use_ascendc:
         if not _ascendc_available():
-            if impl == "ascendc":
+            if impl in ("ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"):
                 raise RuntimeError(
-                    "VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL=ascendc but the "
+                    f"VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL={impl} but the "
                     "npu_glm5_kpool_indexer custom op is not loaded; build the "
                     "custom kernels or switch the selector to auto/triton."
                 )
@@ -181,7 +202,8 @@ def glm5_kpool_indexer(
             index_kpool,
             query.shape[2],
             max_pool_seq_len,
-            0,
+            (_GROUP_TOPK_OUTPUT_MODE if impl == "ascendc_group_topk" else
+             _GROUP_TOPK_M64_OUTPUT_MODE if impl == "ascendc_group_topk_m64" else 0),
         )
         pool_ids = pool_ids[:query.shape[0], 0]  # [T, poolTopk]
         # kernel ships raw ids: mask sentinel / beyond-visibility lanes here.

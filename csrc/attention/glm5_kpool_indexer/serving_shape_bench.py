@@ -34,5 +34,5 @@ def bench(impl, T, pools, tag):
 
 if __name__ == "__main__":
     for pools in (2048, 8192, 16000, 32768, 48000):
-        for impl in ("triton", "ascendc"):
+        for impl in ("triton", "ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"):
             bench(impl, 7680, pools, "srv")

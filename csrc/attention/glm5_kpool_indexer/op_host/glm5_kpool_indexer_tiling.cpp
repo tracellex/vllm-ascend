@@ -51,12 +51,27 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
     const int64_t *headDim = attrs->GetInt(ATTR_HEAD_DIM_INDEX);
     const int64_t *maxPoolSeqLen = attrs->GetInt(ATTR_MAX_POOL_SEQ_LEN_INDEX);
     const int64_t *outputMode = attrs->GetInt(ATTR_OUTPUT_MODE_INDEX);
+    info.outputMode = (outputMode == nullptr) ? 0U : static_cast<uint32_t>(*outputMode);
     OP_CHECK_IF(topkTokens == nullptr || kpool == nullptr || headDim == nullptr || maxPoolSeqLen == nullptr,
                 OP_LOGE(opName, "Glm5KpoolIndexer required attrs missing."), return ge::GRAPH_FAILED);
     OP_CHECK_IF(*headDim != HEAD_DIM_LIMIT, OP_LOGE(opName, "head_dim must be %u, got %ld.", HEAD_DIM_LIMIT, *headDim),
                 return ge::GRAPH_FAILED);
     OP_CHECK_IF(*topkTokens == 0 || *topkTokens > TOPK_TOKENS_LIMIT || *kpool <= 0 || *topkTokens % *kpool != 0,
                 OP_LOGE(opName, "topk_tokens(%ld)/kpool(%ld) invalid.", *topkTokens, *kpool),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(*kpool != 4,
+                OP_LOGE(opName, "kpool must be 4 for the GLM5 KPool indexer, got %ld.", *kpool),
+                return ge::GRAPH_FAILED);
+    const bool groupTopk = info.outputMode == OUTPUT_MODE_GROUP_TOPK ||
+                           info.outputMode == OUTPUT_MODE_GROUP_TOPK_M64;
+    // Group-topk uses only Sort/MrgSort/VEC instructions already proven on
+    // 910B (dav_c220) by the legacy fold chain; the A3-only guard was a
+    // conservative authoring gate, not a hardware requirement. 910B is now
+    // allowed so the build container can validate both group variants.
+    OP_CHECK_IF(groupTopk &&
+                    info.socVersion != platform_ascendc::SocVersion::ASCEND910_93 &&
+                    info.socVersion != platform_ascendc::SocVersion::ASCEND910B,
+                OP_LOGE(opName, "group-topk mode requires 910B or A3."),
                 return ge::GRAPH_FAILED);
 
     const gert::StorageShape &qbarShape = *context->GetInputShape(QBAR_INDEX);
@@ -95,7 +110,6 @@ static ge::graphStatus ParseAndCheckGlm5Kpool(gert::TilingContext *context, Glm5
     info.kpool = static_cast<uint32_t>(*kpool);
     info.poolTopk = info.topkTokens / info.kpool;
     info.outputWidth = info.topkTokens + info.kpool - 1;
-    info.outputMode = (outputMode == nullptr) ? 0U : static_cast<uint32_t>(*outputMode);
     OP_CHECK_IF(info.bSize == 0 || seqShape.GetStorageShape().GetDim(0) != cumDim0,
                 OP_LOGE(opName, "batch size invalid (indexer_seq_lens must match the gather layout)."),
                 return ge::GRAPH_FAILED);
@@ -141,18 +155,26 @@ ge::graphStatus TilingForGlm5KpoolIndexer(gert::TilingContext *context)
         return ge::GRAPH_FAILED;
     }
     const char *opNameTmp = info.opName;
+    const bool groupTopk = info.outputMode == OUTPUT_MODE_GROUP_TOPK ||
+                           info.outputMode == OUTPUT_MODE_GROUP_TOPK_M64;
 
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(info.platformInfo);
     uint32_t blockDim = ascendcPlatform.CalcTschBlockDim(info.aivNum, info.aicNum, info.aivNum);
     context->SetBlockDim(blockDim);
 
-    // Workspace: lib API scratch + per-AIC mm1Res strip (quad-buffered fp32
-    // score tiles; depth 4 closes the AIC-lead-2 race at unit boundaries):
-    // aicNum * 4 * M_TILE(32) * S2_TILE(128) * 4B (~3MB total).
+    // Group mode uses one row-major [M, POOL_GROUP] score scratch per AIC;
+    // the AIC waits for its paired AIV before reusing it.
     constexpr uint32_t M_TILE_WS = 32;
+    constexpr uint32_t M_TILE_GROUP_M64_WS = 64;
     constexpr uint32_t S2_TILE_WS = 128;
+    const uint32_t groupMTile = (info.outputMode == OUTPUT_MODE_GROUP_TOPK_M64)
+                                    ? M_TILE_GROUP_M64_WS
+                                    : M_TILE_WS;
+    const uint32_t scoreScratch = groupTopk
+                                      ? groupMTile * POOL_GROUP
+                                      : 4 * M_TILE_WS * S2_TILE_WS;
     size_t workspaceSize = ascendcPlatform.GetLibApiWorkSpaceSize();
-    workspaceSize += static_cast<size_t>(info.aicNum) * 4 * M_TILE_WS * S2_TILE_WS * sizeof(float);
+    workspaceSize += static_cast<size_t>(info.aicNum) * scoreScratch * sizeof(float);
     // 64B per AIC/AIV pair for the GM progress counters (2KB for 24 pairs)
     workspaceSize += 24 * 64;
     size_t *workSpaces = context->GetWorkspaceSizes(1);

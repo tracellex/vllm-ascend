@@ -20,7 +20,16 @@ constexpr int32_t INVALID_IDX = -1;
 constexpr uint32_t HEAD_DIM = 128;      // index_head_dim (fixed by def check)
 constexpr uint32_t M_TILE = 32;         // token rows per cube base block; 16/AIV
                                         // rows keeps the running top-k strips in UB
+constexpr uint32_t M_TILE_GROUP_M64 = 64; // group-topk candidate; 32 rows per AIV
+constexpr uint32_t POOL_GROUP = 1024;  // Eight S2 tiles folded into one device-side top-k update.
 constexpr uint32_t S2_TILE = 128;       // pools per cube base block
+constexpr uint32_t OUTPUT_MODE_GROUP_TOPK = 3;
+constexpr uint32_t OUTPUT_MODE_GROUP_TOPK_M64 = 4;
+__aicore__ inline bool IsGroupTopkMode(uint32_t mode)
+{
+    return mode == OUTPUT_MODE_GROUP_TOPK || mode == OUTPUT_MODE_GROUP_TOPK_M64;
+}
+static_assert(POOL_GROUP == 8 * S2_TILE, "grouped top-k scratch assumes eight Cube tiles");
 // qbar rows arrive FP32-split as [q_hi | q_lo] BF16 halves (H9): the cube
 // accumulates q_hi@K + q_lo@K in FP32, keeping ~16 mantissa bits of the
 // head-weighted query so top-k boundaries match the FP32 Triton reference.

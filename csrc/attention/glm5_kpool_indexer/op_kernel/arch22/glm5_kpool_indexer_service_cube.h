@@ -31,13 +31,14 @@
 namespace Glm5KpoolKernel {
 using namespace Glm5KpoolCommon;
 
-template <typename Q_T>
+template <typename Q_T, uint32_t M_TILE_SIZE>
 class Glm5KpoolServiceCube {
 public:
     __aicore__ inline Glm5KpoolServiceCube(){};
     __aicore__ inline void InitBuffers(TPipe *pipe);
     __aicore__ inline void InitGlobalTensor(const GlobalTensor<int32_t> &blockTableGm, const GlobalTensor<Q_T> &cacheGm,
-                                            const GlobalTensor<Q_T> &qbarGm, const GlobalTensor<float> &mm1ResGm);
+                                            const GlobalTensor<Q_T> &qbarGm, const GlobalTensor<float> &mm1ResGm,
+                                            const GlobalTensor<float> &scoresOutGm);
     __aicore__ inline void InitParams(const ConstInfo &constInfo);
     __aicore__ inline void AllocEventID();
     __aicore__ inline void FreeEventID();
@@ -58,7 +59,7 @@ public:
     // zeroed lanes (deterministic 7-lane lo-strip loss on probe row 4080).
     static constexpr uint32_t FIX_M_EVENT = EVENT_ID4;
 
-    static constexpr uint64_t M_BLOCK = M_TILE;    // 128
+    static constexpr uint64_t M_BLOCK = M_TILE_SIZE;
     static constexpr uint64_t D_BLOCK = HEAD_DIM;  // 128
     static constexpr uint64_t S2_BLOCK = S2_TILE;  // 128
     // H9 k=256 form: one Mmad over the packed [q_hi | q_lo] x [K | K] inner
@@ -91,7 +92,8 @@ protected:
     GlobalTensor<int32_t> blockTableGm_;
     GlobalTensor<Q_T> cacheGm_;
     GlobalTensor<Q_T> qbarGm_;
-    GlobalTensor<float> mm1ResGm_; // per-AIC [2][M_TILE][S2_TILE] fp32
+    GlobalTensor<float> mm1ResGm_;
+    GlobalTensor<float> scoresOutGm_;
 
     TBuf<TPosition::A1> bufQL1_;
     LocalTensor<Q_T> queryL1_;
@@ -115,14 +117,14 @@ protected:
     ConstInfo constInfo_{};
 };
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::InitParams(const ConstInfo &constInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::InitParams(const ConstInfo &constInfo)
 {
     constInfo_ = constInfo;
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::InitBuffers(TPipe *pipe)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::InitBuffers(TPipe *pipe)
 {
     pipe->InitBuffer(bufQL1_, QUERY_BUF_NUM * QUERY_BUFFER_OFFSET * sizeof(Q_T));
     queryL1_ = bufQL1_.Get<Q_T>();
@@ -136,20 +138,21 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::InitBuffers(TPipe *pipe)
     cL0_ = bufL0C_.Get<float>();
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::InitGlobalTensor(const GlobalTensor<int32_t> &blockTableGm,
-                                                                  const GlobalTensor<Q_T> &cacheGm,
-                                                                  const GlobalTensor<Q_T> &qbarGm,
-                                                                  const GlobalTensor<float> &mm1ResGm)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::InitGlobalTensor(
+    const GlobalTensor<int32_t> &blockTableGm, const GlobalTensor<Q_T> &cacheGm,
+    const GlobalTensor<Q_T> &qbarGm, const GlobalTensor<float> &mm1ResGm,
+    const GlobalTensor<float> &scoresOutGm)
 {
     blockTableGm_ = blockTableGm;
     cacheGm_ = cacheGm;
     qbarGm_ = qbarGm;
     mm1ResGm_ = mm1ResGm;
+    scoresOutGm_ = scoresOutGm;
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::QueryNd2Nz(const RunInfo &runInfo, uint64_t l1Slot)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::QueryNd2Nz(const RunInfo &runInfo, uint64_t l1Slot)
 {
     // qbar is padded to a multiple of M_TILE rows by the wrapper, so full
     // 128-row tiles are always in bounds. Rows are [q_hi | q_lo] packed and
@@ -166,8 +169,8 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::QueryNd2Nz(const RunInfo &runI
     DataCopy(queryL1_[l1Slot * QUERY_BUFFER_OFFSET], qbarGm_[runInfo.tensorQueryOffset], nd2nzPara);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::KeyNd2NzForPA(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::KeyNd2NzForPA(const RunInfo &runInfo)
 {
     // S2_TILE=128 pools == 4 cache blocks of poolsPerBlock=32 (asserted by
     // tiling); each block is one contiguous 32x128 Nd2Nz copy. Out-of-range
@@ -205,8 +208,8 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::KeyNd2NzForPA(const RunInfo &r
     }
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::LoadQueryToL0a(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::LoadQueryToL0a(const RunInfo &runInfo)
 {
     // arch22 A0 loads MUST use the 3D (fmatrix) form: the arch35-style
     // LoadData2DParamsV2 path hangs the MTE1 queue on this core generation.
@@ -241,8 +244,8 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::LoadQueryToL0a(const RunInfo &
                                    loadData3DParams);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::LoadKeyToL0b(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::LoadKeyToL0b(const RunInfo &runInfo)
 {
     // arch22 B0 uses the legacy 1D LoadData2DParams form (v1 arch22 pattern).
     // H9 k=256: 128 fractals load the whole [K | K] block into the single
@@ -258,8 +261,8 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::LoadKeyToL0b(const RunInfo &ru
     LoadData(keyL0_[0], keyL1_[(keyL1BufIdx_ % KEY_BUF_NUM) * KEY_BUFFER_OFFSET], loadData2DParams);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeL0c(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::ComputeL0c(const RunInfo &runInfo)
 {
     (void)runInfo;
     MmadParams mmadParams;
@@ -276,29 +279,32 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeL0c(const RunInfo &runI
     }
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::Fixp(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::Fixp(const RunInfo &runInfo)
 {
-    // NZ2ND fixpipe straight to the per-AIC GM strip; the paired AIVs read
-    // their row halves from there (arch22 has no UB dual-dst fixpipe).
-    // quad-buffer selector: AIC may lead the AIVs by 2 tiles (unit-boundary
-    // TopK lag widens it), so depth 2 ping-pong raced — see kernel.h note.
     AscendC::DataCopyCO12DstParams intriParams;
+    const bool groupTopk = IsGroupTopkMode(constInfo_.outputMode);
     intriParams.mSize = M_BLOCK;
     intriParams.nSize = runInfo.actS2SizeAlign;
-    intriParams.dstStride = runInfo.actS2SizeAlign;
+    intriParams.dstStride = groupTopk ? POOL_GROUP : runInfo.actS2SizeAlign;
     intriParams.srcStride = CeilAlign(M_BLOCK, (uint64_t)BLOCK_CUBE);
     intriParams.quantPre = QuantMode_t::NoQuant;
     intriParams.nz2ndEn = true;
     intriParams.unitFlag = 0b11;
     intriParams.reluPre = 0; // linear scoring: NO relu (GLM5 differs from NSA)
     AscendC::SetFixpipeNz2ndFlag(1, 1, 1);
-    uint64_t dstOffset = (runInfo.loop % 4) * M_BLOCK * S2_BLOCK;
-    AscendC::DataCopy(mm1ResGm_[dstOffset], cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
+    if (groupTopk) {
+        uint32_t groupOffset = runInfo.s2Start % POOL_GROUP;
+        AscendC::DataCopy(mm1ResGm_[groupOffset], cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET],
+                          intriParams);
+    } else {
+        uint64_t dstOffset = (runInfo.loop % 4) * M_BLOCK * S2_BLOCK;
+        AscendC::DataCopy(mm1ResGm_[dstOffset], cL0_[(l0BufIdx_ % L0_BUF_NUM) * L0C_BUFFER_OFFSET], intriParams);
+    }
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runInfo)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::ComputeMm1(const RunInfo &runInfo)
 {
 #define GLMK_CUBE_STAGE 4 // 2=Nd2Nz only, 3=+Load/Mmad, 4=+Fixp (full)
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
@@ -353,8 +359,8 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::ComputeMm1(const RunInfo &runI
     keyL1BufIdx_++;
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::AllocEventID()
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::AllocEventID()
 {
     SetMMLayoutTransform(true);
     SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);
@@ -363,8 +369,8 @@ __aicore__ inline void Glm5KpoolServiceCube<Q_T>::AllocEventID()
     SetFlag<HardEvent::MTE1_MTE2>(QUERY_MTE1_MTE2_EVENT + 1);
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolServiceCube<Q_T>::FreeEventID()
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolServiceCube<Q_T, M_TILE_SIZE>::FreeEventID()
 {
     SetMMLayoutTransform(false);
     WaitFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + 0);

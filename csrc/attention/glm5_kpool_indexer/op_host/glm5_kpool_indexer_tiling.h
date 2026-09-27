@@ -45,6 +45,9 @@ constexpr uint32_t HEAD_DIM_LIMIT = 128;
 // as wide as the cache head dim.
 constexpr uint32_t QBAR_WIDTH = 2 * HEAD_DIM_LIMIT;
 constexpr uint32_t TOPK_TOKENS_LIMIT = 8192;
+constexpr uint32_t OUTPUT_MODE_GROUP_TOPK = 3;
+constexpr uint32_t OUTPUT_MODE_GROUP_TOPK_M64 = 4;
+constexpr uint32_t POOL_GROUP = 1024;
 
 // -----------算子TilingData定义---------------
 BEGIN_TILING_DATA_DEF(Glm5KpoolTilingData)
@@ -58,7 +61,7 @@ TILING_DATA_FIELD_DEF(uint32_t, topkTokens)         // total token top-k (2048)
 TILING_DATA_FIELD_DEF(uint32_t, kpool)              // tokens per pool (4)
 TILING_DATA_FIELD_DEF(uint32_t, poolTopk)           // topkTokens / kpool
 TILING_DATA_FIELD_DEF(uint32_t, outputWidth)        // topkTokens + kpool - 1
-TILING_DATA_FIELD_DEF(uint32_t, outputMode)         // 0 fused indices, 1 raw pool scores
+TILING_DATA_FIELD_DEF(uint32_t, outputMode)         // 0 fused, 1/2 diagnostics, 3/4 grouped device top-k
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
 TILING_DATA_FIELD_DEF(uint32_t, isLDOpen)           // S2-split + LD merge enabled (M2+)
 TILING_DATA_FIELD_DEF(uint32_t, s2SplitNum)         // S2 splits per (m-tile) when LD open

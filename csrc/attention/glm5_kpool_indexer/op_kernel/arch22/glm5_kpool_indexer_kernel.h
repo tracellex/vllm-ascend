@@ -42,7 +42,7 @@ using AscendC::CrossCoreWaitFlag;
 #define GLMK_AIC_STAGE 4
 #endif
 
-template <typename Q_T>
+template <typename Q_T, uint32_t M_TILE_SIZE>
 class Glm5KpoolIndexerKernel {
 public:
     __aicore__ inline Glm5KpoolIndexerKernel(){};
@@ -66,8 +66,8 @@ protected:
     __aicore__ inline void LocateUnit(uint32_t unitIdx, uint32_t &reqIdx, uint32_t &mTileInReq) const;
     __aicore__ inline void SplitCore(uint32_t aiCoreIdx, uint32_t coreNum);
     __aicore__ inline void ProcessUnit(uint32_t unitIdx, uint32_t &loop);
-    Glm5KpoolServiceCube<Q_T> matmulService;
-    Glm5KpoolServiceVector<Q_T> vectorService;
+    Glm5KpoolServiceCube<Q_T, M_TILE_SIZE> matmulService;
+    Glm5KpoolServiceVector<Q_T, M_TILE_SIZE> vectorService;
 
     GlobalTensor<int32_t> cumQueryLensGm;
     GlobalTensor<int32_t> indexerSeqLensGm;
@@ -87,8 +87,9 @@ protected:
 
 // ---------------------------------------------------------------- helpers
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::InitTilingData(const Glm5KpoolTilingData *__restrict t)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::InitTilingData(
+    const Glm5KpoolTilingData *__restrict t)
 {
     constInfo_.tSize = t->tSize;
     constInfo_.bSize = t->bSize;
@@ -109,41 +110,41 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::InitTilingData(const Glm5Kpo
 // compiles to a vector-granularity access and faults at non-32B-aligned
 // offsets, while AIC-side scalar reads are safe at any offset. Every index is
 // therefore multiplied by 8 before GetValue.
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqTokenStart(uint32_t reqIdx) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::ReqTokenStart(uint32_t reqIdx) const
 {
     return reqIdx == 0 ? 0 : static_cast<uint32_t>(cumQueryLensGm.GetValue((reqIdx - 1) * 8));
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqTokenLen(uint32_t reqIdx) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::ReqTokenLen(uint32_t reqIdx) const
 {
     uint32_t end = static_cast<uint32_t>(cumQueryLensGm.GetValue(reqIdx * 8));
     return end - ReqTokenStart(reqIdx);
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::ReqPoolLen(uint32_t reqIdx) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::ReqPoolLen(uint32_t reqIdx) const
 {
     int32_t seqLen = indexerSeqLensGm.GetValue(reqIdx * 8);
     uint32_t p = static_cast<uint32_t>(Max(seqLen, 0));
     return Min(p, constInfo_.maxPoolSeqLen);
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::UnitMTileNum(uint32_t reqIdx) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::UnitMTileNum(uint32_t reqIdx) const
 {
-    return CeilDiv(ReqTokenLen(reqIdx), M_TILE);
+    return CeilDiv(ReqTokenLen(reqIdx), M_TILE_SIZE);
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::UnitS2TileNum(uint32_t reqIdx) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::UnitS2TileNum(uint32_t reqIdx) const
 {
     return CeilDiv(ReqPoolLen(reqIdx), S2_TILE);
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::TotalUnits() const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::TotalUnits() const
 {
     uint32_t units = 0;
     for (uint32_t b = 0; b < constInfo_.bSize; b++) {
@@ -152,8 +153,8 @@ __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::TotalUnits() const
     return units;
 }
 
-template <typename Q_T>
-__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::TotalS2Tiles() const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::TotalS2Tiles() const
 {
     uint32_t tiles = 0;
     for (uint32_t b = 0; b < constInfo_.bSize; b++) {
@@ -162,9 +163,9 @@ __aicore__ inline uint32_t Glm5KpoolIndexerKernel<Q_T>::TotalS2Tiles() const
     return tiles;
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::LocateUnit(uint32_t unitIdx, uint32_t &reqIdx,
-                                                               uint32_t &mTileInReq) const
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::LocateUnit(uint32_t unitIdx, uint32_t &reqIdx,
+                                                                           uint32_t &mTileInReq) const
 {
     uint32_t acc = 0;
     for (uint32_t b = 0; b < constInfo_.bSize; b++) {
@@ -181,8 +182,8 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::LocateUnit(uint32_t unitIdx,
 }
 
 // Whole units to cores, contiguous in unit order, balanced by S2 tile count.
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::SplitCore(uint32_t aiCoreIdx, uint32_t coreNum)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::SplitCore(uint32_t aiCoreIdx, uint32_t coreNum)
 {
     uint32_t totalUnits = TotalUnits();
     coreEnable_ = false;
@@ -222,8 +223,8 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::SplitCore(uint32_t aiCoreIdx
 
 // ---------------------------------------------------------------- lifecycle
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::Init(
     __gm__ uint8_t *qbar, __gm__ uint8_t *indexerCache, __gm__ uint8_t *cumQueryLens,
     __gm__ uint8_t *indexerSeqLens, __gm__ uint8_t *indexerBlockTable, __gm__ uint8_t *positions,
     __gm__ uint8_t *indicesOut, __gm__ uint8_t *scoresDebugOut, __gm__ uint8_t *workspace,
@@ -253,7 +254,9 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
     // — with depth 2 the AIC could overwrite the very half the AIV was about
     // to read (duplicate-tile corruption, one lost S2 tile per hit row).
     // Lead 2 < depth 4 closes the window.
-    uint64_t stripSize = static_cast<uint64_t>(4) * M_TILE * S2_TILE * sizeof(float);
+    uint64_t stripSize = static_cast<uint64_t>(
+        IsGroupTopkMode(constInfo_.outputMode) ? M_TILE_SIZE * POOL_GROUP
+                                               : 4 * M_TILE_SIZE * S2_TILE) * sizeof(float);
     mm1ResGm.SetGlobalBuffer((__gm__ float *)(workspace + aiCoreIdx_ * stripSize));
 
     if ASCEND_IS_AIV {
@@ -268,7 +271,8 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
         matmulService.InitParams(constInfo_);
         matmulService.InitGlobalTensor(blockTableGm,
                                        *reinterpret_cast<GlobalTensor<Q_T> *>(&indexerCache),
-                                       *reinterpret_cast<GlobalTensor<Q_T> *>(&qbar), mm1ResGm);
+                                       *reinterpret_cast<GlobalTensor<Q_T> *>(&qbar), mm1ResGm,
+                                       *reinterpret_cast<GlobalTensor<float> *>(&scoresDebugOut));
     }
     if ASCEND_IS_AIV {
         vectorService.InitBuffers(pipe_);
@@ -277,8 +281,8 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Init(
     }
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx, uint32_t &loop)
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::ProcessUnit(uint32_t unitIdx, uint32_t &loop)
 {
     uint32_t reqIdx, mTileInReq;
     LocateUnit(unitIdx, reqIdx, mTileInReq);
@@ -286,18 +290,69 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
 
     RunInfo runInfo;
     runInfo.reqIdx = reqIdx;
-    runInfo.mStart = ReqTokenStart(reqIdx) + mTileInReq * M_TILE;
-    runInfo.actMSize = Min(M_TILE, ReqTokenLen(reqIdx) - mTileInReq * M_TILE);
+    runInfo.mStart = ReqTokenStart(reqIdx) + mTileInReq * M_TILE_SIZE;
+    runInfo.actMSize = Min(M_TILE_SIZE, ReqTokenLen(reqIdx) - mTileInReq * M_TILE_SIZE);
     runInfo.reqPoolLen = ReqPoolLen(reqIdx);
-    runInfo.posBase = mTileInReq * M_TILE; // pos within the request (units never span requests)
+    runInfo.posBase = mTileInReq * M_TILE_SIZE; // units never span requests
     runInfo.tensorQueryOffset = static_cast<uint64_t>(runInfo.mStart) * QBAR_ROW_ELEMS;
+
+    if (s2Num == 0) {
+        if ASCEND_IS_AIV {
+            vectorService.ProcessEmptyUnit(runInfo);
+        }
+        return;
+    }
+
+    if (IsGroupTopkMode(constInfo_.outputMode)) {
+        constexpr uint32_t TILES_PER_GROUP = POOL_GROUP / S2_TILE;
+        for (uint32_t firstTile = 0; firstTile < s2Num; firstTile += TILES_PER_GROUP) {
+            const uint32_t tileCount = Min(TILES_PER_GROUP, s2Num - firstTile);
+            RunInfo groupInfo = runInfo;
+            groupInfo.loop = loop;
+            groupInfo.s2TileIdx = firstTile;
+            groupInfo.s2Start = firstTile * S2_TILE;
+            groupInfo.actS2Size = Min(S2_TILE, runInfo.reqPoolLen - groupInfo.s2Start);
+            groupInfo.actS2SizeAlign = S2_TILE;
+            groupInfo.isFirstS2InnerLoop = (firstTile == 0);
+            groupInfo.isLastS2InnerLoop = (firstTile + tileCount == s2Num);
+            groupInfo.isValid = true;
+
+            if ASCEND_IS_AIC {
+                CrossCoreWaitFlag(syncV1C1_);
+                for (uint32_t i = 0; i < tileCount; i++) {
+                    RunInfo tileInfo = groupInfo;
+                    tileInfo.loop = loop++;
+                    tileInfo.s2TileIdx = firstTile + i;
+                    tileInfo.s2Start = tileInfo.s2TileIdx * S2_TILE;
+                    tileInfo.actS2Size = Min(S2_TILE, runInfo.reqPoolLen - tileInfo.s2Start);
+#if GLMK_AIC_STAGE >= 2
+                    matmulService.ComputeMm1(tileInfo);
+#endif
+                }
+                CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_FIX>(syncC1V1_);
+            } else {
+                CrossCoreWaitFlag(syncC1V1_);
+#if GLMK_STAGE_GATE >= 2
+                vectorService.ProcessPoolGroup(groupInfo);
+#endif
+#if GLMK_STAGE_GATE >= 4
+                if (groupInfo.isLastS2InnerLoop) {
+                    vectorService.ProcessTopK(groupInfo);
+                }
+#endif
+                CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
+                loop += tileCount;
+            }
+        }
+        return;
+    }
 
     for (uint32_t s2Tile = 0; s2Tile < s2Num; s2Tile++) {
         runInfo.loop = loop;
         runInfo.s2TileIdx = s2Tile;
         runInfo.s2Start = s2Tile * S2_TILE;
         runInfo.actS2Size = Min(S2_TILE, runInfo.reqPoolLen - runInfo.s2Start);
-        runInfo.actS2SizeAlign = S2_TILE; // fixed width (F3-equivalent)
+        runInfo.actS2SizeAlign = S2_TILE;
         runInfo.isFirstS2InnerLoop = (s2Tile == 0);
         runInfo.isLastS2InnerLoop = (s2Tile == s2Num - 1);
         runInfo.isValid = true;
@@ -324,10 +379,30 @@ __aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::ProcessUnit(uint32_t unitIdx
     }
 }
 
-template <typename Q_T>
-__aicore__ inline void Glm5KpoolIndexerKernel<Q_T>::Process()
+template <typename Q_T, uint32_t M_TILE_SIZE>
+__aicore__ inline void Glm5KpoolIndexerKernel<Q_T, M_TILE_SIZE>::Process()
 {
     if (!coreEnable_) {
+        return;
+    }
+
+    if (IsGroupTopkMode(constInfo_.outputMode)) {
+        if ASCEND_IS_AIV {
+            vectorService.AllocEventID();
+            CrossCoreSetFlag<FIA_SYNC_MODE2, PIPE_MTE2>(syncV1C1_);
+        } else {
+            matmulService.AllocEventID();
+        }
+        uint32_t loop = 0;
+        for (uint32_t u = unitFirst_; u <= unitLast_; u++) {
+            ProcessUnit(u, loop);
+        }
+        if ASCEND_IS_AIV {
+            vectorService.FreeEventID();
+        } else {
+            matmulService.FreeEventID();
+            CrossCoreWaitFlag(syncV1C1_);
+        }
         return;
     }
 
