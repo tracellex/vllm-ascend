@@ -41,7 +41,7 @@ KPOOL = 4
 INDEX_TOPK = 2048  # pool_topk = 512, matches the serving attr
 
 
-def build_inputs(t_lens, ppb, max_pool, seed):
+def build_inputs(t_lens, ppb, max_pool, seed, pool_lens=None):
     gen = torch.Generator().manual_seed(seed)
     device = "npu:0"
     n_req = len(t_lens)
@@ -51,10 +51,13 @@ def build_inputs(t_lens, ppb, max_pool, seed):
     logits = torch.randn(T, HEADS, generator=gen, dtype=torch.float32)
     weights = torch.softmax(logits, dim=1).to(torch.bfloat16)
 
-    # Pool units per request: ceil(len / kpool); clamp to max_pool for the
-    # visible-pool ceiling path (max_pool < needed also exercises masking).
-    pool_lens = torch.tensor(
-        [(l + KPOOL - 1) // KPOOL for l in t_lens], dtype=torch.int32)
+    # Pool units per request: ceil(len / kpool) by default (a 2k-token row
+    # sees only ~500 pools — the ceiling arg alone never grows the real
+    # pool count, which once made a "pools=49k" bench silently measure 2k);
+    # pass pool_lens explicitly to emulate long-context cache states.
+    if pool_lens is None:
+        pool_lens = [(l + KPOOL - 1) // KPOOL for l in t_lens]
+    pool_lens = torch.tensor(pool_lens, dtype=torch.int32)
     total_pools = max(int(pool_lens.max()), 1)
     n_blocks = (total_pools + ppb - 1) // ppb
 

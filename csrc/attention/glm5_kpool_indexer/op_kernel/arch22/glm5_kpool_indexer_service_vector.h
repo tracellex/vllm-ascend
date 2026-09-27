@@ -54,6 +54,7 @@ public:
 
 protected:
     __aicore__ inline uint32_t RowVisiblePools(int32_t pos, int32_t reqPoolLen) const;
+    __aicore__ inline void FlattenStripRuns(const LocalTensor<float> &strip, uint32_t runCount);
     __aicore__ inline void LoadRowMeta(const RunInfo &runInfo);
     __aicore__ inline void FoldBlockIntoRowTopk(uint32_t rowLocal, const RunInfo &runInfo);
     __aicore__ inline void EmitRow(uint32_t rowLocal, const RunInfo &runInfo);
@@ -86,8 +87,11 @@ protected:
 
     int32_t posCache_[ROWS_PER_AIV] = {0};
     uint32_t visibleCache_[ROWS_PER_AIV] = {0};
-    // live pair count of each row's running strip (merge-fold state)
+    // live pair count / sorted-run count of each row's running strip
+    // (lazy merge-fold state: runs are appended untouched while live <
+    // poolTopk, flattened on first overflow or at emit)
     uint32_t liveCache_[ROWS_PER_AIV] = {0};
+    uint32_t runCountCache_[ROWS_PER_AIV] = {0};
     uint32_t blockId_ = 0;
     uint32_t aivHalf_ = 0;
     uint32_t poolTopk_ = 0;
@@ -185,7 +189,34 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::LoadRowMeta(const RunInfo &r
     InitSortOutBuf(globalTopkUb_, ROWS_PER_AIV * topkStride_ * 2);
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
         liveCache_[r] = 0;
+        runCountCache_[r] = 0;
     }
+}
+
+// k sorted 128-runs sit contiguously at strip[0]; merge them into one
+// sorted run (k is 2..4 — a single run needs no work). Lengths stay
+// 32-multiples per the M6 granularity lesson.
+template <typename Q_T>
+__aicore__ inline void Glm5KpoolServiceVector<Q_T>::FlattenStripRuns(const LocalTensor<float> &strip,
+                                                                     uint32_t runCount)
+{
+    AscendC::MrgSort4Info p;
+    p.elementLengths[MRG_QUE_0] = (runCount > 0) ? S2_TILE : 0;
+    p.elementLengths[MRG_QUE_1] = (runCount > 1) ? S2_TILE : 0;
+    p.elementLengths[MRG_QUE_2] = (runCount > 2) ? S2_TILE : 0;
+    p.elementLengths[MRG_QUE_3] = (runCount > 3) ? S2_TILE : 0;
+    p.ifExhaustedSuspension = false;
+    p.validBit = static_cast<uint8_t>((1u << runCount) - 1u);
+    p.repeatTimes = 1;
+    AscendC::MrgSortSrcList<float> s;
+    s.src1 = strip[0];
+    s.src2 = strip[S2_TILE * VALUE_AND_INDEX_NUM];
+    s.src3 = strip[2 * S2_TILE * VALUE_AND_INDEX_NUM];
+    s.src4 = strip[3 * S2_TILE * VALUE_AND_INDEX_NUM];
+    AscendC::MrgSort<float>(mrgTmpUb_, s, p);
+    AscendC::PipeBarrier<PIPE_V>();
+    AscendC::DataCopy(strip, mrgTmpUb_, runCount * S2_TILE * VALUE_AND_INDEX_NUM);
+    AscendC::PipeBarrier<PIPE_V>();
 }
 
 template <typename Q_T>
@@ -256,26 +287,35 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
     // descending full sort of the 128-lane block
     SortAll(sortDstUb_, scoreUb_, scoreIdxUb_, mrgTmpUb_, S2_TILE);
 
-    // Fold the sorted 128-run into the running strip with ONE 2-way merge of
-    // two already-sorted descending runs (O(live+128)) instead of a full
-    // 1024-pair resort: the strip prefix [0, liveAlign) is sorted and the
-    // block is sorted, so MrgSort4(validBit 0b0011) merges them exactly.
-    // Run lengths stay multiples of 32 (the lightning queue granularity the
-    // M6 eviction bug taught us to respect); the evicted tail is re-padded
-    // to the -inf/-1 sentinel so no stale real pair ever re-enters a merge
-    // window or the emit window.
+    // Lazy fold: while the strip is below capacity the sorted 128-run is
+    // merely APPENDED (strip = concatenation of up to 4 sorted runs, zero
+    // merges); only the first overflow fold flattens the runs (one
+    // MrgSort4) and from then on every fold is a single 2-way merge of two
+    // sorted runs (O(640)) — still 32-multiple lengths throughout (the M6
+    // eviction-granularity lesson). The evicted tail is re-padded to the
+    // -inf/-1 sentinel so no stale real pair re-enters a merge or emit
+    // window; EmitRow flattens any still-lazy runs before reading top-512.
     LocalTensor<float> strip = globalTopkUb_[rowLocal * topkStride_ * 2];
     uint32_t live = liveCache_[rowLocal];
-    uint32_t liveNew = Min(poolTopk_, live + S2_TILE);
-    if (live == 0) {
-        AscendC::DataCopy(strip, sortDstUb_, S2_TILE * 2);
+    if (live + S2_TILE <= poolTopk_) {
+        AscendC::DataCopy(strip[live * 2], sortDstUb_, S2_TILE * 2);
         PipeBarrier<PIPE_V>();
-        InitSortOutBuf(strip[S2_TILE * 2],
-                       static_cast<int64_t>((topkStride_ - S2_TILE) * 2));
-    } else {
-        uint32_t liveAlign = (live + 31U) & ~31U;
+        if (live == 0) {
+            InitSortOutBuf(strip[S2_TILE * 2],
+                           static_cast<int64_t>((topkStride_ - S2_TILE) * 2));
+        }
+        liveCache_[rowLocal] = live + S2_TILE;
+        runCountCache_[rowLocal]++;
+        SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
+        return;
+    }
+    if (runCountCache_[rowLocal] > 1) {
+        FlattenStripRuns(strip, runCountCache_[rowLocal]);
+        runCountCache_[rowLocal] = 1;
+    }
+    {
         AscendC::MrgSort4Info p;
-        p.elementLengths[MRG_QUE_0] = liveAlign;
+        p.elementLengths[MRG_QUE_0] = poolTopk_; // liveAlign == poolTopk_ here
         p.elementLengths[MRG_QUE_1] = S2_TILE;
         p.elementLengths[MRG_QUE_2] = 0;
         p.elementLengths[MRG_QUE_3] = 0;
@@ -287,14 +327,10 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::FoldBlockIntoRowTopk(uint32_
         s.src2 = sortDstUb_[0];
         AscendC::MrgSort<float>(mrgTmpUb_, s, p);
         AscendC::PipeBarrier<PIPE_V>();
-        AscendC::DataCopy(strip, mrgTmpUb_, (liveAlign + S2_TILE) * 2);
+        AscendC::DataCopy(strip, mrgTmpUb_, (poolTopk_ + S2_TILE) * 2);
         AscendC::PipeBarrier<PIPE_V>();
-        if (liveNew < poolTopk_ + S2_TILE) {
-            InitSortOutBuf(strip[liveNew * 2],
-                           static_cast<int64_t>((poolTopk_ + S2_TILE - liveNew) * 2));
-        }
+        InitSortOutBuf(strip[poolTopk_ * 2], static_cast<int64_t>(S2_TILE * 2));
     }
-    liveCache_[rowLocal] = liveNew;
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT);
 }
 
@@ -322,6 +358,12 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T>::EmitRow(uint32_t rowLocal, c
     uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + rowLocal;
     uint32_t rowGlobal = runInfo.mStart + rowInTile;
     uint32_t visible = visibleCache_[rowLocal];
+    // lazy append leaves the strip as several sorted runs; the top-512 read
+    // below needs one sorted prefix.
+    if (runCountCache_[rowLocal] > 1) {
+        FlattenStripRuns(globalTopkUb_[rowLocal * topkStride_ * 2], runCountCache_[rowLocal]);
+        runCountCache_[rowLocal] = 1;
+    }
 
     // Extract the interleaved index half of the running top-k strip and ship
     // it raw through the VECOUT queue: out-of-range / sentinel lanes are
