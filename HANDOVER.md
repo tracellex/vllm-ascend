@@ -1,8 +1,10 @@
-# HANDOVER — Glm5KpoolIndexer M6 闭环(H9 已修),M7 端到端进行中
+# HANDOVER — Glm5KpoolIndexer M6/M7 收官(全部闭环)
 
-> 状态:2026-09-27,H9 FP32-qbar 保真已修复并通过全链验收;M7(serving
-> 端到端 TTFT/精度 A/B)待执行。研究档案见主仓
-> `research/active/glm5-kpool-indexer/{experiments,hypotheses}.md`(H9 全轮次)。
+> 状态:2026-09-27,H7/H8/H9 + 排序链归并优化 + M7 端到端全部完成。
+> worktree HEAD e3b08ad8c(625315aee=H7/H8/H9,e3b08ad8c=merge-fold)。
+> 端到端:gsm8k-20 正式口径 **95.00**;TTFT bs2-64k **15.19s** / 192k
+> **71.08s**(基线 15.33/72.29)。研究档案见主仓
+> `research/active/glm5-kpool-indexer/{experiments,hypotheses}.md`。
 
 ## 最终形态(k=256 packed Mmad)
 
