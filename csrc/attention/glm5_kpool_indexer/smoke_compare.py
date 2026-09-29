@@ -215,6 +215,14 @@ CASES = {
     # zero-pool request between two non-empty ones: mid-batch M-tile units
     "zeropool-mid": (lambda: build_inputs([64, 32, 64], 32, 64, seed=21,
                                            pool_lens=[64, 0, 32])),
+    # split mode only: request whose pools all land in batch 0 while the
+    # global batch count is 2 — the AIV must emit the staged strip on the
+    # first batch past the request's pool range (batchIdx == ceil(P/4096)).
+    "earlypool": (lambda: build_inputs([64], 32, 8192, seed=22, pool_lens=[100])),
+    # split mode only: same early-pool shape mixed with a full-range request,
+    # so one launch pair has an emitting unit and a folding unit together.
+    "earlypool-mix": (lambda: build_inputs([64, 128], 32, 8192, seed=23,
+                                           pool_lens=[100, 8192])),
 }
 
 
@@ -223,7 +231,8 @@ def main():
     p.add_argument("--cases", nargs="+", default=["tiny"], choices=sorted(CASES))
     p.add_argument("--ppb", type=int, default=None,
                    help="override pools-per-block (cache.shape[1]) for all cases")
-    p.add_argument("--impl", choices=("ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"),
+    p.add_argument("--impl", choices=("ascendc", "ascendc_group_topk", "ascendc_group_topk_m64",
+                                      "ascendc_group_topk_split"),
                    default="ascendc_group_topk", help="AscendC implementation under test")
     args = p.parse_args()
 

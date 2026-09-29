@@ -28,6 +28,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--dump", required=True, help="sentinel dump root")
     p.add_argument("--max-calls", type=int, default=60)
+    p.add_argument("--impl", default="ascendc_group_topk",
+                   choices=("ascendc_group_topk", "ascendc_group_topk_m64",
+                            "ascendc_group_topk_split"))
     p.add_argument("--pids", nargs="*", default=None,
                    help="restrict to these pid dirs (default: one dir, the largest)")
     args = p.parse_args()
@@ -64,7 +67,7 @@ def main():
         )
         pools = int(d["indexer_seq_lens"].max())
         tag = f"{os.path.basename(os.path.dirname(f))}/{os.path.basename(f)} T={d['query'].shape[0]} pools={pools}"
-        ref, test = S.run_impl(inputs)
+        ref, test = S.run_impl(inputs, impl=args.impl)
         ok &= S.compare(ref, test, tag, inputs=inputs)
         if d["query"].shape[0] > 1024:
             prefill_rows += ref.shape[0]

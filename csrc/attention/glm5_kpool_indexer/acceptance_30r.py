@@ -20,7 +20,8 @@ import smoke_compare as S
 names = ["tiny", "single96", "packed2", "packed3", "widescreen", "big",
          "contend2k", "contend4k", "contend-pack", "group-tail"]
 parser = argparse.ArgumentParser()
-parser.add_argument("--impl", choices=("ascendc_group_topk", "ascendc_group_topk_m64"),
+parser.add_argument("--impl", choices=("ascendc_group_topk", "ascendc_group_topk_m64",
+                                       "ascendc_group_topk_split"),
                     default="ascendc_group_topk")
 impl = parser.parse_args().impl
 ok = True

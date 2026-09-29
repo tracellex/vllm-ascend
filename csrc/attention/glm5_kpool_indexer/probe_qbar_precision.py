@@ -23,6 +23,7 @@ quantization-boundary rows.
 
 from __future__ import annotations
 
+import argparse
 import sys
 
 import torch
@@ -52,6 +53,10 @@ def logical_keys(inputs):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--impl", default="ascendc_group_topk",
+                        choices=("ascendc_group_topk", "ascendc_group_topk_split"))
+    args = parser.parse_args()
     inputs = S.build_inputs([4096], 32, 2048, seed=17)
     dev = "npu:0"
     query = inputs["query"].float().cpu()
@@ -67,19 +72,20 @@ def main() -> None:
     ref16 = qbar16.float() @ keys.t()  # single-bf16 qbar control
 
     qbar2 = G._compute_qbar(inputs["query"], inputs["weights"])
-    _, scores = torch.ops._C_ascend.npu_glm5_kpool_indexer(
-        qbar2,
-        inputs["indexer_cache"],
-        G._gather8_lens(inputs["cum_query_lens"]),
-        G._gather8_lens(inputs["indexer_seq_lens"]),
-        inputs["indexer_block_table"],
-        G._pad_positions(inputs["positions"].to(torch.int32)),
-        2048,
-        4,
-        inputs["query"].shape[2],
-        inputs["max_pool"],
-        1,
-    )
+    gather_cum = G._gather8_lens(inputs["cum_query_lens"])
+    gather_seq = G._gather8_lens(inputs["indexer_seq_lens"])
+    positions_pad = G._pad_positions(inputs["positions"].to(torch.int32))
+    if args.impl == "ascendc_group_topk_split":
+        scores = torch.empty((qbar2.shape[0], 4096), dtype=torch.float32, device=dev)
+        torch.ops._C_ascend.npu_glm5_kpool_split_aic(
+            qbar2, inputs["indexer_cache"], gather_cum, gather_seq,
+            inputs["indexer_block_table"], positions_pad, 2048, 4,
+            inputs["query"].shape[2], inputs["max_pool"], 0, scores)
+    else:
+        _, scores = torch.ops._C_ascend.npu_glm5_kpool_indexer(
+            qbar2, inputs["indexer_cache"], gather_cum, gather_seq,
+            inputs["indexer_block_table"], positions_pad, 2048, 4,
+            inputs["query"].shape[2], inputs["max_pool"], 1)
     torch.npu.synchronize()
     asc = scores[: positions.shape[0]].float().cpu()
 

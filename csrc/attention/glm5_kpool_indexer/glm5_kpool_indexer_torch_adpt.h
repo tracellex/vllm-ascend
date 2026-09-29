@@ -57,6 +57,29 @@ inline std::tuple<at::Tensor, at::Tensor> npu_glm5_kpool_indexer(
     return outputs;
 }
 
+// ---- Split (de-mixed) launch pair: see arch22/glm5_kpool_indexer_kernel_split.h.
+// The wrapper owns the cross-launch tensors: `scoresOut` [T_pad, batchPools]
+// fp32 for the AIC half, `scoresIn` + `runningStrip` [T_pad, poolTopk*2] fp32
+// for the AIV half, `indicesOut` for the final emit.
+inline void npu_glm5_kpool_split_aic(
+    const at::Tensor &qbar, const at::Tensor &indexerCache, const at::Tensor &cumQueryLens,
+    const at::Tensor &indexerSeqLens, const at::Tensor &indexerBlockTable, const at::Tensor &positions,
+    int64_t topkTokens, int64_t kpool, int64_t headDim, int64_t maxPoolSeqLen, int64_t splitBatch,
+    const at::Tensor &scoresOut)
+{
+    EXEC_NPU_CMD(aclnnGlm5KpoolSplitAic, qbar, indexerCache, cumQueryLens, indexerSeqLens, indexerBlockTable,
+                 positions, topkTokens, kpool, headDim, maxPoolSeqLen, splitBatch, scoresOut);
+}
+
+inline void npu_glm5_kpool_split_aiv(
+    const at::Tensor &cumQueryLens, const at::Tensor &indexerSeqLens, const at::Tensor &positions,
+    const at::Tensor &scoresIn, const at::Tensor &runningStrip, int64_t topkTokens, int64_t kpool,
+    int64_t headDim, int64_t maxPoolSeqLen, int64_t splitBatch, const at::Tensor &indicesOut)
+{
+    EXEC_NPU_CMD(aclnnGlm5KpoolSplitAiv, cumQueryLens, indexerSeqLens, positions, scoresIn, runningStrip,
+                 topkTokens, kpool, headDim, maxPoolSeqLen, splitBatch, indicesOut);
+}
+
 } // namespace vllm_ascend::glm5_kpool
 
 #endif // GLM5_KPOOL_INDEXER_TORCH_ADPT_H

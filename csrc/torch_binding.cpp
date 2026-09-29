@@ -3148,6 +3148,27 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         ") -> (Tensor indices, Tensor scores_debug)"
     );
     ops.impl("npu_glm5_kpool_indexer", torch::kPrivateUse1, &vllm_ascend::glm5_kpool::npu_glm5_kpool_indexer);
+    // Split (de-mixed) launch pair; cross-launch tensors are caller-owned.
+    ops.def(
+        "npu_glm5_kpool_split_aic("
+            "Tensor qbar, Tensor indexer_cache, Tensor cum_query_lens, "
+            "Tensor indexer_seq_lens, Tensor indexer_block_table, Tensor positions, "
+            "int topk_tokens, int kpool, int head_dim, int max_pool_seq_len, int split_batch, "
+            "Tensor scores_out"
+        ") -> ()"
+    );
+    ops.impl("npu_glm5_kpool_split_aic", torch::kPrivateUse1,
+             &vllm_ascend::glm5_kpool::npu_glm5_kpool_split_aic);
+    ops.def(
+        "npu_glm5_kpool_split_aiv("
+            "Tensor cum_query_lens, Tensor indexer_seq_lens, Tensor positions, "
+            "Tensor scores, Tensor running_strip, "
+            "int topk_tokens, int kpool, int head_dim, int max_pool_seq_len, int split_batch, "
+            "Tensor indices_out"
+        ") -> ()"
+    );
+    ops.impl("npu_glm5_kpool_split_aiv", torch::kPrivateUse1,
+             &vllm_ascend::glm5_kpool::npu_glm5_kpool_split_aiv);
 
     // k2q_csr: q2k -> k2q CSR (Meta/Hist/RowPrefix/TilePrefix/Scatter)
     ops.def(

@@ -146,7 +146,8 @@ def glm5_kpool_indexer(
     corner_shape = query.shape[0] == 0 or max_pool_seq_len == 0
     if corner_shape:
         use_ascendc = False
-    elif impl in ("auto", "ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"):
+    elif impl in ("auto", "ascendc", "ascendc_group_topk", "ascendc_group_topk_m64",
+                  "ascendc_group_topk_split"):
         use_ascendc = True
     else:
         if impl != "triton":
@@ -170,7 +171,8 @@ def glm5_kpool_indexer(
 
     if use_ascendc:
         if not _ascendc_available():
-            if impl in ("ascendc", "ascendc_group_topk", "ascendc_group_topk_m64"):
+            if impl in ("ascendc", "ascendc_group_topk", "ascendc_group_topk_m64",
+                        "ascendc_group_topk_split"):
                 raise RuntimeError(
                     f"VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL={impl} but the "
                     "npu_glm5_kpool_indexer custom op is not loaded; build the "
@@ -191,6 +193,37 @@ def glm5_kpool_indexer(
             )
         qbar = _compute_qbar(query, weights.to(query.dtype))
         positions_pad = _pad_positions(positions.to(torch.int32))
+        if impl == "ascendc_group_topk_split":
+            # De-mixed launch pair (pure AIC + pure AIV per 4096-pool batch) so
+            # the indexer co-schedules with the HCCL stream instead of excluding
+            # it like the fused MIX kernel; see kernel_split.h for the contract.
+            pool_topk = index_topk // index_kpool
+            t_pad = qbar.shape[0]
+            # The AIC's fixpipe always writes a full M_BLOCK=32-row tile, so
+            # the AIC-owned staging tensors must be tile-padded (the fused
+            # kernel got this for free from its tiling-allocated workspace).
+            t_rows = (t_pad + 31) // 32 * 32
+            n_batches = (max_pool_seq_len + 4095) // 4096
+            scores = torch.empty((t_rows, 4096), dtype=torch.float32, device=qbar.device)
+            strip = torch.empty((t_rows, pool_topk * 2), dtype=torch.float32, device=qbar.device)
+            pool_ids = torch.empty((t_pad, 1, pool_topk), dtype=torch.int32, device=qbar.device)
+            gather_cum = _gather8_lens(cum_query_lens)
+            gather_seq = _gather8_lens(indexer_seq_lens)
+            for batch in range(n_batches):
+                torch.ops._C_ascend.npu_glm5_kpool_split_aic(
+                    qbar, indexer_cache, gather_cum, gather_seq,
+                    indexer_block_table, positions_pad,
+                    index_topk, index_kpool, query.shape[2], max_pool_seq_len, batch, scores)
+                torch.ops._C_ascend.npu_glm5_kpool_split_aiv(
+                    gather_cum, gather_seq, positions_pad, scores, strip,
+                    index_topk, index_kpool, query.shape[2], max_pool_seq_len, batch, pool_ids)
+            del scores, strip
+            pool_ids = pool_ids[:query.shape[0], 0]
+            visible = _visible_pool_lengths(
+                positions, cum_query_lens, indexer_seq_lens, index_kpool, max_pool_seq_len)
+            pool_ids = torch.where(pool_ids < visible.unsqueeze(1), pool_ids,
+                                   torch.full_like(pool_ids, -1))
+            return _expand_pool_ids(pool_ids, positions, index_topk, index_kpool)
         pool_ids, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
             qbar,
             indexer_cache,

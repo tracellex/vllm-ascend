@@ -156,6 +156,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend910_93 ]]; then
         "grouped_matmul_swiglu_quant_weight_nz_tensor_list"
         "lightning_indexer"
         "glm5_kpool_indexer"
+        "glm5_kpool_split_aic"
+        "glm5_kpool_split_aiv"
         "sparse_flash_attention"
         "kv_quant_sparse_flash_attention"
         "dispatch_ffn_combine"
