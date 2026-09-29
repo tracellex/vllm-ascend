@@ -1,5 +1,12 @@
 # HANDOVER — Glm5KpoolIndexer 方案2(去 mix 拆分)交接
 
+> **终局更新 (2026-09-29 晚)**:下方断点描述已过时——fixpipe 崩溃与全部构建
+> 问题已在 build20 解决,**正确性门 100% 全绿,引擎 A/B 完胜**:64k TTFT
+> 9.79s vs triton 15.67(-37.5%)、192k 28.11 vs 68.61(-59%)、gsm8k 无差、
+> 12 连发无劣化。现场已回滚 triton 交付态。完整总结/切换指南/踩坑全录见主仓
+> `research/active/glm5-kpool-indexer/FINAL-REPORT.md`;本文件余下内容保留为
+> codex 时代的过程交接存档。
+>
 > 日期:2026-09-29。接收方:codex。上一版 HANDOVER(M1-M7 战役史)已并入主仓
 > `research/active/glm5-kpool-indexer/experiments.md`,本文件只覆盖方案 2。
 > **一句话断点**:split 双算子代码全部落地、15 轮构建链打通、aclnn 公共壳
