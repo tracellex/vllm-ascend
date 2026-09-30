@@ -327,7 +327,12 @@ class MooncakePullRecvingThread(threading.Thread):
             local_num_kv_heads = self.block_shapes[local_layer_index][0][0]
             remote_num_kv_heads = remote_metadata.block_shapes[remote_layer_index][0][0]
             local_dcp_size, remote_dcp_size = self._get_full_attention_dcp_sizes(
-                spec, local_layer_index, remote_layer_index, remote_metadata, remote_pcp_size, remote_dcp_size
+                spec,
+                local_layer_index,
+                remote_layer_index,
+                remote_metadata,
+                getattr(remote_metadata, "pcp_size", 1),
+                remote_dcp_size,
             )
         else:
             raise NotImplementedError(f"Mooncake pull has no TP grouping rule for KV cache spec {type(spec).__name__}")
@@ -593,7 +598,12 @@ class MooncakePullRecvingThread(threading.Thread):
                 remote_tp_rank_groups = tp_rank_groups_by_layer[layer_pair]
                 if isinstance(spec, FullAttentionSpec):
                     local_dcp_size, layer_remote_dcp_size = self._get_full_attention_dcp_sizes(
-                        spec, local_layer_index, remote_layer_index, remote_metadata, remote_pcp_size, remote_dcp_size
+                        spec,
+                        local_layer_index,
+                        remote_layer_index,
+                        remote_metadata,
+                        getattr(remote_metadata, "pcp_size", 1),
+                        remote_dcp_size,
                     )
                 else:
                     local_dcp_size, layer_remote_dcp_size = self.dcp_size, remote_dcp_size
@@ -1150,7 +1160,7 @@ class MooncakePullRecvingThread(threading.Thread):
                 first_local_layer_index,
                 first_remote_layer_index,
                 remote_metadata,
-                remote_pcp_size,
+                getattr(remote_metadata, "pcp_size", 1),
                 remote_dcp_size,
             )
         total_num_kv_heads = self._infer_total_num_kv_heads(
