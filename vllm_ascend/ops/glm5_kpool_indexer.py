@@ -160,16 +160,26 @@ def _validated_output_buffer(
     return output_buffer
 
 
-def _return_indices(indices: torch.Tensor, output_buffer: torch.Tensor | None) -> torch.Tensor:
+def _return_indices(
+    indices: torch.Tensor,
+    cum_query_lens: torch.Tensor,
+    output_buffer: torch.Tensor | None,
+) -> torch.Tensor:
     """Return [T, 1, W] indices, writing through to the caller's buffer if set.
 
-    The AscendC paths materialize their own tensors, so a provided buffer
-    (cudagraph FULL capture/replay reuse) is filled with a copy and its view
-    returned; addresses stay stable across replays.
+    FULL-graph batches carry padded token rows; the wrapper masks them to -1
+    in-kernel (live = token < query_ends[-1]) and PR#17542 removed the
+    model-side masked_fill_ that used to do it — mirror it here so both
+    implementations stay value-identical. With a capture buffer the final
+    rows are copied into it and its view returned; addresses stay stable
+    across replays.
     """
+    num_tokens = indices.shape[0]
+    live = torch.arange(num_tokens, device=indices.device) < cum_query_lens[-1]
+    indices.masked_fill_(~live[:, None, None], -1)
     if output_buffer is None:
         return indices
-    num_tokens, _, output_width = indices.shape
+    _, _, output_width = indices.shape
     output_buffer[:num_tokens, :output_width].copy_(indices[:, 0, :])
     return output_buffer[:num_tokens, :output_width].unsqueeze(1)
 
@@ -293,7 +303,7 @@ def glm5_kpool_indexer(
                                    torch.full_like(pool_ids, -1))
             indices = _expand_pool_ids(pool_ids, positions, index_topk, index_kpool,
                                        pack_tail=pack_tail)
-            return _return_indices(indices, output_buffer)
+            return _return_indices(indices, cum_query_lens, output_buffer)
         pool_ids, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
             qbar,
             indexer_cache,
@@ -321,7 +331,7 @@ def glm5_kpool_indexer(
                                torch.full_like(pool_ids, -1))
         indices = _expand_pool_ids(pool_ids, positions, index_topk, index_kpool,
                                    pack_tail=pack_tail)
-        return _return_indices(indices, output_buffer)
+        return _return_indices(indices, cum_query_lens, output_buffer)
 
     return glm5_next_lightning_indexer_triton(
         query, indexer_cache, weights, cum_query_lens, indexer_seq_lens,
