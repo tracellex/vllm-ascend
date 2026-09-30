@@ -73,12 +73,25 @@ def _supports_ascendc_config(index_topk: int, index_kpool: int) -> bool:
 
 
 def _gather8_lens(x: torch.Tensor) -> torch.Tensor:
-    """Mirror a [B] lens vector to stride 8: element i lands at byte offset
+    """Mirror a [N] int32 vector to stride 8: element i lands at byte offset
     32*i, i.e. every element 32B-aligned. The AIV scalar GM read compiles to
     a vector-granularity access and faults at unaligned offsets, so the kernel
     reads these arrays as ``GetValue(idx * 8)`` on the mirrored layout."""
     out = torch.zeros(x.shape[0] * 8, dtype=torch.int32, device=x.device)
     out[0::8] = x.to(torch.int32)
+    return out.contiguous()
+
+
+def _gather8_positions(positions_pad: torch.Tensor) -> torch.Tensor:
+    """Mirror padded int32 positions [T_pad] to the same stride-8 layout.
+
+    The split AIV kernel reads per-row causal positions scalar-wise from GM
+    (``GetValue(row * 8)``); absolute positions — not row-in-request — drive
+    visibility, so prefix-cache hits and decode select the right pool window
+    (defect t_e3dfea56). dim0 stays T_pad to keep the op's infer-shape view
+    of the token count unchanged."""
+    out = torch.zeros(positions_pad.shape[0] * 8, dtype=torch.int32, device=positions_pad.device)
+    out[0::8] = positions_pad
     return out.contiguous()
 
 
@@ -287,13 +300,16 @@ def glm5_kpool_indexer(
             pool_ids = torch.empty((t_pad, 1, pool_topk), dtype=torch.int32, device=qbar.device)
             gather_cum = _gather8_lens(cum_query_lens)
             gather_seq = _gather8_lens(indexer_seq_lens)
+            # Absolute positions on the same stride-8 mirror: the AIV folds
+            # causal visibility per row from these (t_e3dfea56).
+            gather_pos = _gather8_positions(positions_pad)
             for batch in range(n_batches):
                 torch.ops._C_ascend.npu_glm5_kpool_split_aic(
                     qbar, indexer_cache, gather_cum, gather_seq,
-                    indexer_block_table, positions_pad,
+                    indexer_block_table, gather_pos,
                     index_topk, index_kpool, query.shape[2], max_pool_seq_len, batch, scores)
                 torch.ops._C_ascend.npu_glm5_kpool_split_aiv(
-                    gather_cum, gather_seq, positions_pad, scores, strip,
+                    gather_cum, gather_seq, gather_pos, scores, strip,
                     index_topk, index_kpool, query.shape[2], max_pool_seq_len, batch, pool_ids)
             del scores, strip
             pool_ids = pool_ids[:query.shape[0], 0]

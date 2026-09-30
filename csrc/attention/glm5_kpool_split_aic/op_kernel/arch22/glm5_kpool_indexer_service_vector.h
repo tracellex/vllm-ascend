@@ -182,11 +182,15 @@ __aicore__ inline uint32_t Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::RowVisibleP
 }
 
 // On the first S2 tile of a token tile: cache per-row positions/visibility
-// and reset the running top-k strips. No GM scalar reads: the AIV scalar
-// load compiles to a vector-granularity access that faults at non-32B-aligned
-// offsets (positions were the original offender; the request pool length
-// rides in RunInfo and pos is derived arithmetically — a unit never spans
-// requests, so pos == posBase + rowInTile).
+// and reset the running top-k strips. Causal positions are read from the
+// positions GM tensor — the ABSOLUTE per-token offsets (prefix-cache hits
+// and decode carry pos != row-in-request; deriving pos arithmetically from
+// the row index silently collapsed visibility for cached prefill/decode,
+// see defect t_e3dfea56). The wrapper mirrors positions to stride 8 so each
+// scalar GM read lands on a 32-byte boundary (the AIV scalar load compiles
+// to a vector-granularity access and faults at unaligned offsets — the M5
+// lesson; same gather8 layout the request-length vectors already use). The
+// request pool length rides in RunInfo.
 template <typename Q_T, uint32_t M_TILE_SIZE>
 __aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::LoadRowMeta(const RunInfo &runInfo, bool initStrip)
 {
@@ -194,7 +198,7 @@ __aicore__ inline void Glm5KpoolServiceVector<Q_T, M_TILE_SIZE>::LoadRowMeta(con
     for (uint32_t r = 0; r < ROWS_PER_AIV; r++) {
         uint32_t rowInTile = aivHalf_ * ROWS_PER_AIV + r;
         posCache_[r] = (rowInTile < runInfo.actMSize)
-                           ? static_cast<int32_t>(runInfo.posBase + rowInTile)
+                           ? positionsGm.GetValue((runInfo.mStart + rowInTile) * 8)
                            : -1; // padded row marker
         visibleCache_[r] = RowVisiblePools(posCache_[r], reqPoolLen);
     }
