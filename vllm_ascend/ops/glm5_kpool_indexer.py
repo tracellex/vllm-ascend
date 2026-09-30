@@ -83,12 +83,14 @@ def _gather8_lens(x: torch.Tensor) -> torch.Tensor:
 
 
 def _expand_pool_ids(pool_ids: torch.Tensor, positions: torch.Tensor, index_topk: int,
-                     index_kpool: int) -> torch.Tensor:
+                     index_kpool: int, *, pack_tail: bool = False) -> torch.Tensor:
     """Pool ids -> token indices, mirroring the Triton wrapper post-processing.
 
-    history: pid*kpool + {0..kpool-1}, -1 padded to index_topk columns; the
-    causal tail (kpool-1 columns) mirrors the Triton operator's fixed tail
-    block (append_causal_tail on the model side is idempotent over it).
+    history: pid*kpool + {0..kpool-1}, -1 padded to index_topk columns; with
+    ``pack_tail`` the causal tail (kpool-1 columns) is scattered directly after
+    the last valid history column (mirroring the Triton operator's packed tail
+    and the model-side ``append_causal_tail``), otherwise it keeps the fixed
+    tail block starting at column index_topk.
     """
     num_tokens = pool_ids.shape[0]
     device = pool_ids.device
@@ -105,7 +107,19 @@ def _expand_pool_ids(pool_ids: torch.Tensor, positions: torch.Tensor, index_topk
     tail = torch.where(tail_cols.unsqueeze(0) < (positions + 1 - tail_start).unsqueeze(1),
                        tail_start.unsqueeze(1) + tail_cols.unsqueeze(0),
                        torch.full((num_tokens, index_kpool - 1), -1, dtype=torch.long, device=device))
-    return torch.cat([hist, tail.to(hist.dtype)], dim=1).view(num_tokens, 1, -1)
+    tail = tail.to(hist.dtype)
+    if pack_tail:
+        # PR#17542 packed layout: the tail follows the last valid history
+        # column (min(tail_start, topk)) instead of a fixed top-k offset, so
+        # short requests expose their unpooled tokens without -1 holes.
+        tail_slots = tail_start.clamp_max(index_topk).unsqueeze(1) + tail_cols.unsqueeze(0)
+        packed = torch.cat(
+            [hist, torch.full((num_tokens, index_kpool - 1), -1, dtype=hist.dtype, device=device)],
+            dim=1,
+        )
+        packed.scatter_(1, tail_slots, tail)
+        return packed.view(num_tokens, 1, -1)
+    return torch.cat([hist, tail], dim=1).view(num_tokens, 1, -1)
 
 
 def _visible_pool_lengths(
@@ -124,6 +138,42 @@ def _visible_pool_lengths(
     return visible.clamp_max(max_pool_seq_len)
 
 
+def _validated_output_buffer(
+    output_buffer: torch.Tensor | None,
+    query: torch.Tensor,
+    num_tokens: int,
+    output_width: int,
+) -> torch.Tensor | None:
+    """Mirror the Triton wrapper's output-buffer contract (dtype/layout/size)."""
+    if output_buffer is None:
+        return None
+    if (
+        output_buffer.ndim != 2
+        or output_buffer.dtype != torch.int32
+        or output_buffer.device != query.device
+        or output_buffer.stride(1) != 1
+        or (num_tokens > 1 and output_buffer.stride(0) < output_buffer.shape[1])
+    ):
+        raise ValueError("GLM KPool output buffer requires int32 contiguous columns on the query device.")
+    if output_buffer.shape[0] < num_tokens or output_buffer.shape[1] < output_width:
+        raise ValueError("GLM KPool output buffer must cover the token rows and top-k width.")
+    return output_buffer
+
+
+def _return_indices(indices: torch.Tensor, output_buffer: torch.Tensor | None) -> torch.Tensor:
+    """Return [T, 1, W] indices, writing through to the caller's buffer if set.
+
+    The AscendC paths materialize their own tensors, so a provided buffer
+    (cudagraph FULL capture/replay reuse) is filled with a copy and its view
+    returned; addresses stay stable across replays.
+    """
+    if output_buffer is None:
+        return indices
+    num_tokens, _, output_width = indices.shape
+    output_buffer[:num_tokens, :output_width].copy_(indices[:, 0, :])
+    return output_buffer[:num_tokens, :output_width].unsqueeze(1)
+
+
 def glm5_kpool_indexer(
     query: torch.Tensor,
     indexer_cache: torch.Tensor,
@@ -136,8 +186,19 @@ def glm5_kpool_indexer(
     index_topk: int,
     index_kpool: int,
     max_pool_seq_len: int,
+    output_buffer: torch.Tensor | None = None,
+    pack_tail: bool = False,
+    allow_cache_packing: bool = True,
 ) -> torch.Tensor:
-    """Select sparse token indices; returns [T, 1, index_topk + kpool - 1] int32."""
+    """Select sparse token indices; returns [T, 1, index_topk + kpool - 1] int32.
+
+    Keyword arguments match the Triton wrapper (PR#17542 contract):
+    ``output_buffer`` captures the [T, W] int32 output for cudagraph FULL
+    replay (both impls write through when provided); ``pack_tail`` scatters
+    the causal tail right after the valid history (consumed by the Triton
+    kernel and the AscendC expansion); ``allow_cache_packing`` only affects
+    the Triton path — the AscendC kernels always read pages directly.
+    """
     global _warned_fallback
 
     impl = VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL
@@ -190,7 +251,14 @@ def glm5_kpool_indexer(
                 query, indexer_cache, weights, cum_query_lens, indexer_seq_lens,
                 indexer_block_table, positions, index_topk=index_topk,
                 index_kpool=index_kpool, max_pool_seq_len=max_pool_seq_len,
+                output_buffer=output_buffer, pack_tail=pack_tail,
+                allow_cache_packing=allow_cache_packing,
             )
+        # Both AscendC paths materialize their outputs before the expansion, so
+        # validate the capture buffer once up front (mirror of the wrapper's
+        # checks) — a later copy_ into a wrong-dtype buffer would silently cast.
+        _validated_output_buffer(output_buffer, query, query.shape[0],
+                                 index_topk + index_kpool - 1)
         qbar = _compute_qbar(query, weights.to(query.dtype))
         positions_pad = _pad_positions(positions.to(torch.int32))
         if impl == "ascendc_group_topk_split":
@@ -223,7 +291,9 @@ def glm5_kpool_indexer(
                 positions, cum_query_lens, indexer_seq_lens, index_kpool, max_pool_seq_len)
             pool_ids = torch.where(pool_ids < visible.unsqueeze(1), pool_ids,
                                    torch.full_like(pool_ids, -1))
-            return _expand_pool_ids(pool_ids, positions, index_topk, index_kpool)
+            indices = _expand_pool_ids(pool_ids, positions, index_topk, index_kpool,
+                                       pack_tail=pack_tail)
+            return _return_indices(indices, output_buffer)
         pool_ids, _ = torch.ops._C_ascend.npu_glm5_kpool_indexer(
             qbar,
             indexer_cache,
@@ -249,10 +319,14 @@ def glm5_kpool_indexer(
         )
         pool_ids = torch.where(pool_ids < visible.unsqueeze(1), pool_ids,
                                torch.full_like(pool_ids, -1))
-        return _expand_pool_ids(pool_ids, positions, index_topk, index_kpool)
+        indices = _expand_pool_ids(pool_ids, positions, index_topk, index_kpool,
+                                   pack_tail=pack_tail)
+        return _return_indices(indices, output_buffer)
 
     return glm5_next_lightning_indexer_triton(
         query, indexer_cache, weights, cum_query_lens, indexer_seq_lens,
         indexer_block_table, positions, index_topk=index_topk,
         index_kpool=index_kpool, max_pool_seq_len=max_pool_seq_len,
+        output_buffer=output_buffer, pack_tail=pack_tail,
+        allow_cache_packing=allow_cache_packing,
     )
