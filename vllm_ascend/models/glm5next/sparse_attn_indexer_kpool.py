@@ -12,8 +12,8 @@ from torch import nn
 from vllm_ascend.ops.triton.glm5_next_kpool_tail_compress import (  # type: ignore[import-untyped]
     glm5_next_kpool_tail_compress_and_write_cache_triton,
 )
-from vllm_ascend.ops.triton.glm5_next_lightning_indexer import (  # type: ignore[import-untyped]
-    glm5_next_lightning_indexer_triton,
+from vllm_ascend.ops.glm5_kpool_indexer import (  # type: ignore[import-untyped]
+    glm5_kpool_indexer,
 )
 
 if TYPE_CHECKING:
@@ -79,6 +79,8 @@ class SparseAttnIndexerKpool(nn.Module):
         index_kpool: int,
         max_pool_seq_len: int,
         compute_topk: bool,
+        output_buffer: torch.Tensor | None = None,
+        allow_cache_packing: bool = True,
     ) -> torch.Tensor | None:
         num_tokens = k.shape[0]
         if index_kpool <= 0 or self.topk_tokens % index_kpool:
@@ -127,7 +129,7 @@ class SparseAttnIndexerKpool(nn.Module):
             return None
         if q_values is None or weights is None:
             raise ValueError("GLM KPool top-k requires query and head weights.")
-        indices = glm5_next_lightning_indexer_triton(
+        indices = glm5_kpool_indexer(
             q_values,
             indexer_cache,
             weights.to(q_values.dtype),
@@ -138,10 +140,9 @@ class SparseAttnIndexerKpool(nn.Module):
             index_topk=self.topk_tokens,
             index_kpool=index_kpool,
             max_pool_seq_len=max_pool_seq_len,
+            output_buffer=output_buffer,
+            pack_tail=True,
+            allow_cache_packing=allow_cache_packing,
         )
-        # A2/A3 SFA requires a contiguous valid prefix; the reference indexer
-        # puts the running tail at the fixed top-k column for short requests.
-        append_causal_tail(indices[:, 0], positions, self.topk_tokens, index_kpool)
-        valid = torch.arange(num_tokens, device=k.device) < indexer_metadata.cum_query_lens[-1]
-        indices.masked_fill_(~valid[:, None, None], -1)
+        # Expansion also packs the causal tail and clears every padded row.
         return indices
