@@ -87,6 +87,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # (safe for Ascend 910B/A3). Set to a positive value to override when
     # auto-detection is unavailable or for debugging UB overflow issues.
     "VLLM_ASCEND_ROPE_UB_SIZE_KB": lambda: int(os.getenv("VLLM_ASCEND_ROPE_UB_SIZE_KB") or 0),
+    # GLM-Next KPool lightning indexer selector. Default to Triton until the
+    # A3 grouped-topk path passes serving-shape performance and precision gates.
+    # Valid values: triton/auto/ascendc/ascendc_group_topk/ascendc_group_topk_m64.
+    "VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL": lambda: os.getenv("VLLM_ASCEND_GLM5_KPOOL_INDEXER_IMPL", "triton"),
 }
 
 # end-env-vars-definition

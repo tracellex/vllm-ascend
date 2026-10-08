@@ -249,6 +249,31 @@ std::tuple<at::Tensor, at::Tensor> npu_lightning_indexer_meta(
     return std::tuple<at::Tensor, at::Tensor>(sparse_indices_out, sparse_values_out);
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_glm5_kpool_indexer_meta(
+    const at::Tensor &qbar, const at::Tensor &indexer_cache, const at::Tensor &cum_query_lens,
+    const at::Tensor &indexer_seq_lens, const at::Tensor &indexer_block_table, const at::Tensor &positions,
+    int64_t topk_tokens, int64_t kpool, int64_t head_dim, int64_t max_pool_seq_len, int64_t output_mode)
+{
+    constexpr int64_t DIM_0 = 0;
+    TORCH_CHECK(topk_tokens > 0 && kpool > 0 && topk_tokens % kpool == 0,
+                "topk_tokens (", topk_tokens, ") must be positive and divisible by kpool (", kpool, ").");
+
+    c10::SymDimVector indicesSize = {qbar.sym_size(DIM_0), c10::SymInt(1),
+                                     c10::SymInt(topk_tokens / kpool)};
+    at::Tensor indices_out =
+        at::empty_symint(indicesSize, qbar.options().dtype(at::kInt));
+    at::Tensor scores_debug_out;
+    if (output_mode == 1) {
+        scores_debug_out = at::empty_symint(
+            c10::SymDimVector{qbar.sym_size(DIM_0), c10::SymInt(max_pool_seq_len)},
+            qbar.options().dtype(at::kFloat));
+    } else {
+        scores_debug_out = at::empty_symint(c10::SymDimVector{c10::SymInt(0)},
+                                            qbar.options().dtype(at::kFloat));
+    }
+    return std::tuple<at::Tensor, at::Tensor>(indices_out, scores_debug_out);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_sparse_flash_attention_meta(
     const at::Tensor &query, const at::Tensor &key, const at::Tensor &value,
     const at::Tensor &sparse_indices, double scale_value,
@@ -2193,6 +2218,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("grouped_matmul_swiglu_quant_v2", &vllm_ascend::meta::grouped_matmul_swiglu_quant_v2_meta);
     // Lightning indexer
     ops.impl("npu_lightning_indexer", &vllm_ascend::meta::npu_lightning_indexer_meta);
+    ops.impl("npu_glm5_kpool_indexer", &vllm_ascend::meta::npu_glm5_kpool_indexer_meta);
     // Sparse flash attention
     ops.impl("npu_sparse_flash_attention", &vllm_ascend::meta::npu_sparse_flash_attention_meta);
     ops.impl("npu_sparse_flash_mla_metadata", &vllm_ascend::meta::npu_sparse_flash_mla_metadata_meta);
