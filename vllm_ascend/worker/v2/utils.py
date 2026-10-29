@@ -78,7 +78,8 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
                         component = kv_cache
                     elif isinstance(kv_cache, (tuple, list)) and component_id < len(kv_cache):
                         component = kv_cache[component_id]
-                    if component is not None:
+                    # 嵌套容器和空视图不能交给上游 zeroer，避免初始化异常和零大小 launch。
+                    if isinstance(component, torch.Tensor) and component.numel() > 0:
                         layer_names.append(layer_name)
                         component_context[layer_name] = SimpleNamespace(kv_cache=component)
                 if layer_names:
