@@ -2505,6 +2505,12 @@ def test_forward_impl_returns_current_runner_contract(monkeypatch, has_shared_ex
 
     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+    # Milestones are only recorded when the shared-expert multistream overlap
+    # is enabled; enable it so the recording contract is exercised here.
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
+    )
 
     result = runner._forward_impl(
         hidden_states,
@@ -2613,6 +2619,10 @@ def test_forward_impl_gathers_sp_input_before_routed_collectives(monkeypatch):
 
     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
+    )
 
     result = runner._forward_impl(
         hidden_states,
@@ -2659,6 +2669,10 @@ def test_forward_impl_records_router_milestones(monkeypatch):
 
     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
+    )
 
     result = runner._forward_impl(
         hidden_states,
@@ -2743,6 +2757,12 @@ def test_internal_router_releases_shared_stream_after_input_cast(monkeypatch):
     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
     monkeypatch.setattr(fused_moe_module.F, "linear", MagicMock(side_effect=router_linear))
+    # Milestones are only recorded when the shared-expert multistream overlap
+    # is enabled; enable it so the recording contract is exercised here.
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
+    )
 
     router_logits, actual_shared_ready, actual_router_ready, actual_submitted_gate_up = (
         runner._prepare_router_and_milestones(
@@ -2812,6 +2832,12 @@ def test_internal_router_without_precast_preserves_gate_forward_and_early_shared
     current_stream.record_event.side_effect = record_event
     monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: True))
     monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+    # Milestones are only recorded when the shared-expert multistream overlap
+    # is enabled; enable it so the recording contract is exercised here.
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=True),
+    )
 
     result = runner._prepare_router_and_milestones(prepared_input, hidden_states, object())
 
@@ -2824,6 +2850,41 @@ def test_internal_router_without_precast_preserves_gate_forward_and_early_shared
         "submit_gate_up",
     ]
     hidden_states.float.assert_not_called()
+
+
+def test_forward_impl_skips_milestones_when_overlap_disabled(monkeypatch):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    runner.routed_input_transform = None
+    runner.routed_output_transform = None
+    hidden_states = torch.randn(2, 4)
+    router_logits = torch.randn(2, 3)
+    routed_out = torch.randn(2, 4)
+    shared_out = torch.randn(2, 4)
+    milestones = RoutedMoEMilestones()
+    runner.routed_experts = SimpleNamespace(forward_impl=MagicMock(return_value=(routed_out, milestones)))
+    runner.ascend_shared_experts = SimpleNamespace(
+        multistream_overlap=False,
+        prepare_input_before_routed=MagicMock(return_value=PreparedSharedExpertInput(hidden_states)),
+        forward=MagicMock(return_value=shared_out),
+    )
+    runner._sequence_parallel_context = MagicMock(return_value=nullcontext())
+    current_stream = MagicMock()
+
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: False))
+    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: current_stream)
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=False),
+    )
+
+    result = runner._forward_impl(hidden_states, router_logits, shared_experts_input=None)
+
+    assert result[0] is shared_out
+    assert result[1] is routed_out
+    current_stream.record_event.assert_not_called()
+    assert milestones.shared_input_ready is None
+    assert milestones.router_output_ready is None
 
 
 @pytest.mark.parametrize("has_shared_experts", [False, True])
@@ -3323,6 +3384,42 @@ def test_release_shared_schedule_requires_w4a8_sp_overlap(monkeypatch, quant_typ
     monkeypatch.setattr(AscendMoERunner, "_can_overlap_sp_shared_with", lambda *_: overlap)
     runner = _stub_moe_runner_init(monkeypatch, quant_type=quant_type)
     assert runner._release_shared_schedule is (overlap and quant_type is QuantType.W4A8)
+
+
+@pytest.mark.parametrize("internal_router", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_release_router_milestones_follow_overlap_switch(monkeypatch, internal_router, overlap):
+    """release 特有的调度分支也须保留开启时的事件，关闭时跳过记录。"""
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    runner._release_shared_schedule = True
+    states, logits, router_input, computed_logits = [object() for _ in range(4)]
+    runner._prepare_router_input = MagicMock(return_value=router_input)
+    runner._apply_router_linear = MagicMock(return_value=computed_logits)
+    stream = MagicMock()
+    first_event, second_event = object(), object()
+    stream.record_event.side_effect = [first_event, second_event]
+    monkeypatch.setattr(AscendMoERunner, "is_internal_router", property(lambda _: internal_router))
+    monkeypatch.setattr(fused_moe_module.torch.npu, "current_stream", lambda: stream)
+    monkeypatch.setattr(
+        "vllm_ascend.ops.fused_moe.moe_mlp.get_ascend_config",
+        lambda: SimpleNamespace(multistream_overlap_shared_expert=overlap),
+    )
+
+    actual_logits, input_ready, output_ready, prepared = runner._prepare_router_and_milestones(
+        PreparedSharedExpertInput(states),
+        states,
+        logits,
+    )
+    assert actual_logits is (computed_logits if internal_router else logits)
+    assert prepared is None
+    if overlap:
+        assert input_ready is first_event
+        assert output_ready is (second_event if internal_router else first_event)
+        assert stream.record_event.call_count == (2 if internal_router else 1)
+    else:
+        assert input_ready is None and output_ready is None
+        stream.record_event.assert_not_called()
 
 
 @pytest.mark.parametrize("internal_router", [False, True])

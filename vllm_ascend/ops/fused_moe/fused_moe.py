@@ -33,6 +33,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
+from vllm_ascend.ops.fused_moe.moe_mlp import maybe_record_event
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts
 from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
@@ -424,7 +425,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
     def _prepare_shared_for_router_overlap(
         self,
         prepared_shared_input: PreparedSharedExpertInput,
-        shared_input_ready: torch.npu.Event,
+        shared_input_ready: torch.npu.Event | None,
     ) -> PreparedSharedExpertExecution | None:
         shared_experts = self.ascend_shared_experts
         assert shared_experts is not None
@@ -442,21 +443,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         router_logits: torch.Tensor,
     ) -> tuple[
         torch.Tensor,
-        torch.npu.Event,
-        torch.npu.Event,
+        torch.npu.Event | None,
+        torch.npu.Event | None,
         SubmittedSharedExpertGateUp | None,
     ]:
         if getattr(self, "_release_shared_schedule", False):
-            # The shared stream observes these events when its complete
-            # forward is submitted after routed_experts.forward_impl.
+            # release 调度路径也只在 shared-expert 多流开启时消费这些事件。
             if self.is_internal_router:
                 router_input = self._prepare_router_input(shared_hidden_states, router_logits)
-                shared_input_ready = torch.npu.current_stream().record_event()
+                shared_input_ready = maybe_record_event()
                 router_logits = self._apply_router_linear(router_input)
                 del router_input
-                router_output_ready = torch.npu.current_stream().record_event()
+                router_output_ready = maybe_record_event()
             else:
-                shared_input_ready = torch.npu.current_stream().record_event()
+                shared_input_ready = maybe_record_event()
                 router_output_ready = shared_input_ready
             return router_logits, shared_input_ready, router_output_ready, None
 
@@ -465,16 +465,16 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             # Release shared Vector/AIV preparation after any external FP32
             # router-input Cast. Gates using their registered forward path may
             # still prepare their input internally.
-            shared_input_ready = torch.npu.current_stream().record_event()
+            shared_input_ready = maybe_record_event()
             prepared_execution = self._prepare_shared_for_router_overlap(
                 prepared_shared_input,
                 shared_input_ready,
             )
             router_logits = self._apply_router_linear(router_input)
             del router_input
-            router_output_ready = torch.npu.current_stream().record_event()
+            router_output_ready = maybe_record_event()
         else:
-            shared_input_ready = torch.npu.current_stream().record_event()
+            shared_input_ready = maybe_record_event()
             prepared_execution = self._prepare_shared_for_router_overlap(
                 prepared_shared_input,
                 shared_input_ready,
