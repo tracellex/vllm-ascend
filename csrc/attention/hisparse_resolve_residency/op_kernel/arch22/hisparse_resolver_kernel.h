@@ -417,7 +417,14 @@ public:
             return;
         }
         if (PublishResident(true)) return;
-        for (int32_t h = 0; h < hashSize; ++h) keys.SetValue(h, -1);
+        // r4a-3: vectorized hash init replaces up to 16K scalar SetValue calls.
+        // hashSize may be non-power-of-2 (bounded by the UB budget), so use
+        // Duplicate over the buffer tail-safely via masked chunk fills.
+        for (int32_t h = 0; h < hashSize; h += kTile) {
+            const int32_t n = hashSize - h < kTile ? hashSize - h : kTile;
+            Duplicate(keys[h], -1, n);
+        }
+        Sync<HardEvent::V_S>();
         // Construct the entire cold union before inspecting or evicting Hot.
         // Descriptor fields are hoisted into locals: the compiler cannot
         // prove the opaque UB tensor ops do not alias the descriptor, so
