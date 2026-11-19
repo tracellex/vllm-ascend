@@ -69,28 +69,12 @@ public:
         pipe.InitBuffer(orderBuffer, hot * sizeof(int32_t));
         pipe.InitBuffer(ioBuffer, 2 * kTile * sizeof(int32_t));
         pipe.InitBuffer(lruBuffer, hot * sizeof(int16_t));
-        // r4a-4: the logical row is bulk-DMA'd once per row and reused by the
-        // union walk, eviction match and Publish recompute passes.
-        pipe.InitBuffer(logicalBuffer, topk * sizeof(int32_t));
         keys = keysBuffer.Get<int32_t>();
         values = valuesBuffer.Get<int32_t>();
         tags = tagsBuffer.Get<int32_t>();
         order = orderBuffer.Get<int32_t>();
         io = ioBuffer.Get<int32_t>();
         lruRow = lruBuffer.Get<int16_t>();
-        lrow = logicalBuffer.Get<int32_t>();
-    }
-
-    // r4a-4: one bulk DMA of the whole logical row replaces topk serialized
-    // GM scalar loads per pass; three passes read the UB copy.
-    __aicore__ inline void LoadLogicalRow(int32_t row)
-    {
-        GlobalTensor<int32_t> globalLogical;
-        globalLogical.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(d.pointers[0]));
-        DataCopyPad(lrow, globalLogical[int64_t(row) * d.geometry[4]],
-                    DataCopyExtParams{1, uint32_t(topk * sizeof(int32_t)), 0, 0, 0},
-                    DataCopyPadExtParams<int32_t>{false, 0, 0, 0});
-        Sync<HardEvent::MTE2_S>();
     }
 
     __aicore__ inline int32_t Request(int32_t row) const
@@ -449,10 +433,9 @@ public:
         const int64_t logicalStride = d.geometry[4];
         int32_t position = 0;
         for (int32_t row = first; row < end; ++row) {
-            LoadLogicalRow(row);
             for (int32_t col = 0; col < topk; ++col) {
                 int32_t host, device;
-                Translate(lrow.GetValue(col), host, device);
+                Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + col), host, device);
                 if (device < 0 && host >= 0) {
                     ++references;
                     // r4a: count distinct cold hosts at insertion time; the
@@ -511,10 +494,9 @@ public:
         const int64_t swapBase = int64_t(first) * topk;
         position = 0;
         for (int32_t row = first; row < end; ++row) {
-            LoadLogicalRow(row);
             for (int32_t col = 0; col < topk; ++col) {
                 int32_t host, device;
-                Translate(lrow.GetValue(col), host, device);
+                Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + col), host, device);
                 int32_t h = device < 0 && host >= 0 ? Lookup(host) : -1;
                 if (h >= 0 && values.GetValue(h) == position) {
                     int32_t slot = order.GetValue(hot - 1 - rank);
@@ -568,13 +550,12 @@ public:
         const uint64_t maskOut = d.pointers[15];
         const bool byteMask = d.geometry[24] != 0;
         for (int32_t row = first; row < end; ++row) {
-            if (valid) LoadLogicalRow(row);
             int32_t count = 0, compactCount = 0;
             for (int32_t base = 0; base < topk; base += kTile) {
                 int32_t extent = topk - base < kTile ? topk - base : kTile;
                 for (int32_t i = 0; i < extent; ++i) {
                     int32_t host = -1, device = -1;
-                    if (valid) Translate(lrow.GetValue(base + i), host, device);
+                    if (valid) Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + base + i), host, device);
                     io.SetValue(kTile + i, host);
                     if (valid && !error && device < 0 && host >= 0) {
                         int32_t h = Lookup(host);
@@ -658,10 +639,9 @@ private:
     int32_t references = 0, misses = 0, error = 0;
     // Last valid page/block-table entries cached by Translate/Physical.
     int32_t reqCol = -1, reqPage = 0, stCol = -1, stPage = 0, blkCol = -1, blkPage = 0;
-    TBuf<TPosition::VECCALC> keysBuffer, valuesBuffer, tagsBuffer, orderBuffer, ioBuffer, lruBuffer, logicalBuffer;
+    TBuf<TPosition::VECCALC> keysBuffer, valuesBuffer, tagsBuffer, orderBuffer, ioBuffer, lruBuffer;
     LocalTensor<int32_t> keys, values, tags, order, io;
     LocalTensor<int16_t> lruRow;
-    LocalTensor<int32_t> lrow;
 };
 
 }  // namespace
