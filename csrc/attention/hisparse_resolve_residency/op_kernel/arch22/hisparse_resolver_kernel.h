@@ -68,11 +68,13 @@ public:
         pipe.InitBuffer(tagsBuffer, hot * sizeof(int32_t));
         pipe.InitBuffer(orderBuffer, hot * sizeof(int32_t));
         pipe.InitBuffer(ioBuffer, 2 * kTile * sizeof(int32_t));
+        pipe.InitBuffer(lruBuffer, hot * sizeof(int16_t));
         keys = keysBuffer.Get<int32_t>();
         values = valuesBuffer.Get<int32_t>();
         tags = tagsBuffer.Get<int32_t>();
         order = orderBuffer.Get<int32_t>();
         io = ioBuffer.Get<int32_t>();
+        lruRow = lruBuffer.Get<int16_t>();
     }
 
     __aicore__ inline int32_t Request(int32_t row) const
@@ -455,8 +457,16 @@ public:
         // evictable/hit partition, halving the hash probes per slot.
         int32_t hits = 0, evictable = 0;
         const uint64_t lruBase = d.pointers[7];
+        // r4a-2: one bulk DMA of the LRU row replaces hot serialized GM
+        // scalar loads; the walk then reads UB only.
+        GlobalTensor<int16_t> globalLru;
+        globalLru.SetGlobalBuffer(reinterpret_cast<__gm__ int16_t *>(lruBase));
+        DataCopyPad(lruRow, globalLru[int64_t(state) * hot],
+                    DataCopyExtParams{1, uint32_t(hot * sizeof(int16_t)), 0, 0, 0},
+                    DataCopyPadExtParams<int16_t>{false, 0, 0, 0});
+        Sync<HardEvent::MTE2_S>();
         for (int32_t p = 0; p < hot; ++p) {
-            int32_t slot = Read<int16_t>(lruBase, int64_t(state) * hot + p);
+            int32_t slot = lruRow.GetValue(p);
             if (slot < 0 || slot >= hot) { error = -1; break; }
             int32_t host = tags.GetValue(slot);
             bool hit = false;
@@ -622,8 +632,9 @@ private:
     int32_t references = 0, misses = 0, error = 0;
     // Last valid page/block-table entries cached by Translate/Physical.
     int32_t reqCol = -1, reqPage = 0, stCol = -1, stPage = 0, blkCol = -1, blkPage = 0;
-    TBuf<TPosition::VECCALC> keysBuffer, valuesBuffer, tagsBuffer, orderBuffer, ioBuffer;
+    TBuf<TPosition::VECCALC> keysBuffer, valuesBuffer, tagsBuffer, orderBuffer, ioBuffer, lruBuffer;
     LocalTensor<int32_t> keys, values, tags, order, io;
+    LocalTensor<int16_t> lruRow;
 };
 
 }  // namespace

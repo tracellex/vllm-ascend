@@ -48,7 +48,9 @@ inline constexpr uint64_t resolver_arch22_ub_budget(uint64_t platform_ub_bytes) 
 }
 
 constexpr uint64_t resolver_arch22_scratch_words(uint64_t hot, uint64_t hash_size) {
-    return 2 * hash_size + 2 * hot + 512;
+    // r4a-2: +ceil(hot/2) words for the int16 LRU row DMA'd into UB before
+    // the membership walk (replaces hot serialized GM scalar loads).
+    return 2 * hash_size + 2 * hot + (hot + 1) / 2 + 512;
 }
 
 constexpr uint64_t resolver_arch22_scratch_bytes(uint64_t hot, uint64_t hash_size) {
@@ -59,7 +61,7 @@ constexpr uint64_t resolver_arch22_hash_capacity(uint64_t hot, uint64_t union_ro
     uint64_t hash_size = 1;
     while (hash_size <= union_rows) hash_size <<= 1;
     const uint64_t available_words = (ub_budget - kResolverDescriptorBytes) / 64 * 16;
-    const uint64_t fixed_words = 2 * hot + 512;
+    const uint64_t fixed_words = 2 * hot + (hot + 1) / 2 + 512;
     const uint64_t max_hash_size = (available_words - fixed_words) / 2;
     return hash_size < max_hash_size ? hash_size : max_hash_size;
 }
