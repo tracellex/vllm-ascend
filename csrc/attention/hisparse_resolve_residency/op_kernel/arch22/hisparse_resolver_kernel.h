@@ -144,7 +144,9 @@ public:
                 if (!insert) return -1;
                 keys.SetValue(h, host);
                 values.SetValue(h, position);
-                return h;
+                // Negative return marks a fresh insertion so the caller can
+                // count distinct cold hosts without a post-pass hash sweep.
+                return -(h + 2);
             }
             if (++h == size) h = 0;
         }
@@ -427,7 +429,11 @@ public:
                 Translate(Read<int32_t>(logicalBase, int64_t(row) * logicalStride + col), host, device);
                 if (device < 0 && host >= 0) {
                     ++references;
-                    if (Lookup(host, true, position) < 0) error = -1;
+                    // r4a: count distinct cold hosts at insertion time; the
+                    // 16384-slot hash sweep below is now redundant.
+                    const int32_t inserted = Lookup(host, true, position);
+                    if (inserted < -1) ++misses;
+                    else if (inserted < 0) error = -1;
                 }
                 ++position;
             }
@@ -463,9 +469,6 @@ public:
                 }
             }
             order.SetValue(hit ? hits++ : hot - 1 - evictable++, slot);
-        }
-        for (int32_t h = 0; h < hashSize; ++h) {
-            if (keys.GetValue(h) >= 0 && values.GetValue(h) >= 0) ++misses;
         }
         if (hits + misses > d.geometry[21] || hits + misses > hot) error = hits + misses;
         if (error) { Publish(true); return; }
